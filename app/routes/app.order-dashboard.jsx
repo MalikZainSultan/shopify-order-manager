@@ -20,7 +20,7 @@ import {
   EmptyState,
   Divider,
   Tooltip,
-  AppProvider as PolarisProvider, // Added for Polaris context wrapping
+  AppProvider as PolarisProvider,
 } from "@shopify/polaris";
 import {
   ChevronDownIcon,
@@ -30,7 +30,6 @@ import {
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
-// React Router Native Data Pipeline Wrapper
 const jsonResponse = (data) => {
   return new Response(JSON.stringify(data), {
     headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -38,7 +37,7 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. BACKEND API ENGINE (2026-04 GRAPHQL SPECIFICATION)             */
+/*  1. BACKEND API ENGINE (UPDATED GRAPHQL SCHEMAS)                   */
 /* ------------------------------------------------------------------ */
 
 const UNFULFILLED_ORDERS_QUERY = `#graphql
@@ -64,8 +63,8 @@ const UNFULFILLED_ORDERS_QUERY = `#graphql
           customer {
             firstName
             lastName
-            email
           }
+          email
           shippingAddress {
             name
             address1
@@ -81,7 +80,7 @@ const UNFULFILLED_ORDERS_QUERY = `#graphql
                 title
                 variantTitle
                 quantity
-                fulfillableQuantity
+                unfulfilledQuantity
                 product {
                   id
                   metafield(namespace: "custom", key: "release_date") {
@@ -143,8 +142,9 @@ function daysBetween(later, earlier) {
 
 function buildCustomerKey(order) {
   const c = order.customer;
+  const email = order.email;
   const a = order.shippingAddress;
-  return [c?.firstName, c?.lastName, c?.email, a?.address1, a?.zip]
+  return [c?.firstName, c?.lastName, email, a?.address1, a?.zip]
     .map((part) => (part || "").toString().trim().toLowerCase())
     .join("|");
 }
@@ -152,12 +152,12 @@ function buildCustomerKey(order) {
 function processOrder(rawOrder, today) {
   const rawLineItems = rawOrder.lineItems.edges
     .map((edge) => edge.node)
-    .filter((li) => li.fulfillableQuantity > 0);
+    .filter((li) => li.unfulfilledQuantity > 0);
 
   if (rawLineItems.length === 0) return null;
 
   const lineItems = rawLineItems.map((li) => {
-    const releaseDateRaw = li.product?.releaseDateMetafield?.value || null;
+    const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = releaseDateRaw ? new Date(releaseDateRaw) : null;
     const isReleased = !releaseDate || releaseDate <= today;
 
@@ -175,7 +175,7 @@ function processOrder(rawOrder, today) {
       title: li.title,
       variantTitle: li.variantTitle,
       quantity: li.quantity,
-      fulfillableQuantity: li.fulfillableQuantity,
+      unfulfilledQuantity: li.unfulfilledQuantity,
       productId: li.product?.id || null,
       releaseDate: releaseDateRaw,
       isReleased,
@@ -199,6 +199,7 @@ function processOrder(rawOrder, today) {
     sourceName: (rawOrder.sourceName || "shopify").toLowerCase(),
     tags: rawOrder.tags || [],
     customer: rawOrder.customer,
+    email: rawOrder.email,
     shippingAddress: rawOrder.shippingAddress,
     lineItems,
     bucket,
@@ -223,7 +224,7 @@ function groupByCustomer(orders) {
       return {
         key: first.customerKey,
         customerName,
-        customerEmail: first.customer?.email || "—",
+        customerEmail: first.email || "—",
         shippingAddress: first.shippingAddress,
         orders: groupOrders,
         isMultiOrder: groupOrders.length > 1,
@@ -304,7 +305,7 @@ export const loader = async ({ request }) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  3. USER INTERFACE GRAPHICAL RENDERING ENGINE                       */
+/*  3. USER INTERFACE GRAPHICAL RENDERING ENGINE                      */
 /* ------------------------------------------------------------------ */
 
 const CHANNEL_OPTIONS = [
@@ -376,7 +377,7 @@ function filterGroupsByQuery(groups, query) {
 }
 
 function OrderSummaryRow({ order, indented }) {
-  const itemCount = order.lineItems.reduce((sum, li) => sum + li.fulfillableQuantity, 0);
+  const itemCount = order.lineItems.reduce((sum, li) => sum + li.unfulfilledQuantity, 0);
   const worstAging = order.lineItems.reduce((worst, li) => {
     if (li.agingStatus === "critical") return "critical";
     if (li.agingStatus === "warning" && worst !== "critical") return "warning";
@@ -396,10 +397,10 @@ function OrderSummaryRow({ order, indented }) {
       </InlineStack>
       <Box paddingBlockStart="150">
         <BlockStack gap="100">
-          {order.lineItems.map((li) => (
+          ={order.lineItems.map((li) => (
             <InlineStack key={li.id} align="space-between">
               <Text as="span" tone="subdued">
-                {li.fulfillableQuantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
+                {li.unfulfilledQuantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
               </Text>
               <InlineStack gap="200">
                 <Text as="span" tone="subdued">
@@ -533,7 +534,7 @@ function PullListTable({ items }) {
       {items.map((item, index) => (
         <IndexTable.Row id={`${item.orderId}-${item.id}`} key={`${item.orderId}-${item.id}`} position={index}>
           <IndexTable.Cell>
-            <Text as="span" fontWeight="semibold">{item.fulfillableQuantity}x {item.title}</Text>
+            <Text as="span" fontWeight="semibold">{item.unfulfilledQuantity}x {item.title}</Text>
             {item.variantTitle && <Text as="span" tone="subdued"> — {item.variantTitle}</Text>}
           </IndexTable.Cell>
           <IndexTable.Cell>{item.orderName}</IndexTable.Cell>
@@ -547,7 +548,6 @@ function PullListTable({ items }) {
   );
 }
 
-// FIXED: Main exported view component properly wrapped in <PolarisProvider> i18n contexts
 export default function FulfillmentDashboard() {
   const { groups, counts, pullListItems, fetchedAt } = useLoaderData();
 
