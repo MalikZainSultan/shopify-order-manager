@@ -6,8 +6,8 @@ embedded = true
 name = "Order Manager"
 
 [access_scopes]
-# Hamare dashboard ke liye orders aur product data read karne ki permissions zaroori hain
-scopes = "read_products, read_orders, write_orders"
+# Added read_customers scope to allow fetching order buyer information
+scopes = "read_products, read_orders, write_orders, read_customers"
 
 [webhooks]
 api_version = "2026-04"
