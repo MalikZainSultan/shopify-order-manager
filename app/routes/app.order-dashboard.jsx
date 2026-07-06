@@ -395,9 +395,10 @@ function OrderSummaryRow({ order, indented }) {
         </InlineStack>
         <AgingBadge agingStatus={worstAging} />
       </InlineStack>
-      <Box paddingBlockStart="150">
-        <BlockStack gap="100">
-          ={order.lineItems.map((li) => (
+   //  Sahi Code:
+<Box paddingBlockStart="150">
+  <BlockStack gap="100">
+    {order.lineItems.map((li) => (
             <InlineStack key={li.id} align="space-between">
               <Text as="span" tone="subdued">
                 {li.unfulfilledQuantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
@@ -595,7 +596,7 @@ export default function FulfillmentDashboard() {
       <Page
         title="Release Date Automated Dispatch Board"
         subtitle="Metafield Synchronization Queue Engine (Zero Manual Tagging Active)"
-        secondaryActions={[{ content: "Force Live Reload", onAction: () => window.location.reload() }]}
+        secondaryActions={[]}
       >
         <Layout>
           <Layout.Section>
