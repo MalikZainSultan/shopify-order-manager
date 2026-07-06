@@ -162,7 +162,6 @@ function processOrder(rawOrder, today) {
   if (rawLineItems.length === 0) return null;
 
   const lineItems = rawLineItems.map((li) => {
-    // Exact mapping to match graphql field shape directly
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = releaseDateRaw ? new Date(releaseDateRaw) : null;
     const isReleased = !releaseDate || releaseDate <= today;
@@ -423,6 +422,7 @@ function OrderSummaryRow({ order, indented }) {
   );
 }
 
+// FIXED DROPDOWN ROW INJECTION ENGINE
 function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) {
   if (groups.length === 0) {
     return (
@@ -444,6 +444,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
         itemCount={groups.length}
         selectable={false}
         headings={[
+          { title: "" }, // Arrow Toggle Cell Head
           { title: "Pack Destination" },
           { title: "Pending Orders" },
           { title: "Delivery Destination" },
@@ -456,64 +457,67 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           const primaryOrder = group.orders[0];
 
           return (
-            <IndexTable.Row id={group.key} key={group.key} position={index} tone={group.isMultiOrder ? "subdued" : undefined}>
-              <IndexTable.Cell>
-                <InlineStack gap="200" blockAlign="center">
-                  {group.isMultiOrder && (
-                    <Button
-                      variant="tertiary"
-                      icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
-                      onClick={() => onToggleGroup(group.key)}
-                    />
-                  )}
+            <React.Fragment key={group.key}>
+              <IndexTable.Row id={group.key} position={index} tone={group.isMultiOrder ? "subdued" : undefined}>
+                <IndexTable.Cell>
+                  <Button
+                    variant="tertiary"
+                    icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
+                    onClick={() => onToggleGroup(group.key)}
+                  />
+                </IndexTable.Cell>
+                <IndexTable.Cell>
                   <BlockStack gap="0">
                     <Text as="span" fontWeight="semibold">{group.customerName}</Text>
                     <Text as="span" tone="subdued">{group.customerEmail}</Text>
                   </BlockStack>
-                </InlineStack>
-              </IndexTable.Cell>
-              <IndexTable.Cell>
-                {group.isMultiOrder ? (
-                  <Badge tone="attention">{`${group.orders.length} Combined Separate Orders`}</Badge>
-                ) : (
-                  <Text as="span">{primaryOrder.name}</Text>
-                )}
-              </IndexTable.Cell>
-              <IndexTable.Cell>
-                <Text as="span">{group.shippingAddress?.address1}{group.shippingAddress?.city ? `, ${group.shippingAddress.city}` : ""}</Text>
-              </IndexTable.Cell>
-              <IndexTable.Cell>
-                <InlineStack gap="150">
-                  {Array.from(new Set(group.orders.map((o) => o.sourceName))).map((src) => (
-                    <ChannelBadge key={src} sourceName={src} />
-                  ))}
-                </InlineStack>
-              </IndexTable.Cell>
-              <IndexTable.Cell>
-                <AgingBadge agingStatus={group.worstAging} />
-              </IndexTable.Cell>
-            </IndexTable.Row>
+                </IndexTable.Cell>
+                <IndexTable.Cell>
+                  {group.isMultiOrder ? (
+                    <Badge tone="attention">{`${group.orders.length} Combined Separate Orders`}</Badge>
+                  ) : (
+                    <Text as="span">{primaryOrder.name}</Text>
+                  )}
+                </IndexTable.Cell>
+                <IndexTable.Cell>
+                  <Text as="span">{group.shippingAddress?.address1}{group.shippingAddress?.city ? `, ${group.shippingAddress.city}` : ""}</Text>
+                </IndexTable.Cell>
+                <IndexTable.Cell>
+                  <InlineStack gap="150">
+                    {Array.from(new Set(group.orders.map((o) => o.sourceName))).map((src) => (
+                      <ChannelBadge key={src} sourceName={src} />
+                    ))}
+                  </InlineStack>
+                </IndexTable.Cell>
+                <IndexTable.Cell>
+                  <AgingBadge agingStatus={group.worstAging} />
+                </IndexTable.Cell>
+              </IndexTable.Row>
+
+              {/* DYNAMIC COLLAPSIBLE RENDERING INLINE TABLE TD SLOTS */}
+              {isExpanded && (
+                <tr style={{ backgroundColor: "var(--p-color-bg-surface-secondary)" }}>
+                  <td colSpan={6} style={{ padding: "12px 24px" }}>
+                    <Box padding="400">
+                      <BlockStack gap="300">
+                        <Text as="h4" fontWeight="bold" tone="subdued">
+                          Consolidated Shipping Matrix Elements:
+                        </Text>
+                        {group.orders.map((order, i) => (
+                          <Box key={order.id}>
+                            <OrderSummaryRow order={order} indented={false} />
+                            {i < group.orders.length - 1 && <Divider />}
+                          </Box>
+                        ))}
+                      </BlockStack>
+                    </Box>
+                  </td>
+                </tr>
+              )}
+            </React.Fragment>
           );
         })}
       </IndexTable>
-
-      {groups
-        .filter((g) => g.isMultiOrder && expandedGroups.has(g.key))
-        .map((group) => (
-          <Collapsible key={`${group.key}-detail`} open={expandedGroups.has(group.key)} id={`${group.key}-collapsible`}>
-            <Box padding="400" background="bg-surface-secondary" borderBlockStartWidth="025" borderColor="border">
-              <BlockStack gap="300">
-                <Text as="h3" fontWeight="semibold">Consolidated Shipping Block — {group.customerName}</Text>
-                {group.orders.map((order, i) => (
-                  <Box key={order.id}>
-                    <OrderSummaryRow order={order} indented />
-                    {i < group.orders.length - 1 && <Divider />}
-                  </Box>
-                ))}
-              </BlockStack>
-            </Box>
-          </Collapsible>
-        ))}
     </BlockStack>
   );
 }
@@ -598,6 +602,14 @@ export default function FulfillmentDashboard() {
 
   return (
     <PolarisProvider i18n={{}}>
+      {/* INJECTING DYNAMIC STYLE BLOCK FOR .Polaris-Page WRAPPER CLASSES */}
+      <style>{`
+        .Polaris-Page {
+          max-width: fit-content !important;
+          margin: 0 auto;
+        }
+      `}</style>
+      
       <Page
         title="Release Date Automated Dispatch Board"
         subtitle="Metafield Synchronization Queue Engine (Zero Manual Tagging Active)"
