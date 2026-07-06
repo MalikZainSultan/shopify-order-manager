@@ -1,0 +1,24 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "dcf0ff631f3b80de06acf67c730c3ad5"
+application_url = "https://example.com"
+embedded = true
+name = "Order Manager"
+
+[access_scopes]
+# Hamare dashboard ke liye orders aur product data read karne ki permissions zaroori hain
+scopes = "read_products, read_orders, write_orders"
+
+[webhooks]
+api_version = "2026-04"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+[auth]
+redirect_urls = [ "https://example.com/api/auth" ]
+
+[build]
+include_config_on_deploy = true
+automatically_update_urls_on_dev = true
