@@ -444,7 +444,6 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
         itemCount={groups.length}
         selectable={false}
         headings={[
-          { title: "" }, // Dropdown toggle arrow column
           { title: "Pack Destination" },
           { title: "Pending Orders" },
           { title: "Delivery Destination" },
@@ -457,65 +456,64 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           const primaryOrder = group.orders[0];
 
           return (
-            <React.Fragment key={group.key}>
-              <IndexTable.Row id={group.key} position={index} tone={group.isMultiOrder ? "subdued" : undefined}>
-                <IndexTable.Cell>
-                  <Button
-                    variant="tertiary"
-                    icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
-                    onClick={() => onToggleGroup(group.key)}
-                  />
-                </IndexTable.Cell>
-                <IndexTable.Cell>
+            <IndexTable.Row id={group.key} key={group.key} position={index} tone={group.isMultiOrder ? "subdued" : undefined}>
+              <IndexTable.Cell>
+                <InlineStack gap="200" blockAlign="center">
+                  {group.isMultiOrder && (
+                    <Button
+                      variant="tertiary"
+                      icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
+                      onClick={() => onToggleGroup(group.key)}
+                    />
+                  )}
                   <BlockStack gap="0">
                     <Text as="span" fontWeight="semibold">{group.customerName}</Text>
                     <Text as="span" tone="subdued">{group.customerEmail}</Text>
                   </BlockStack>
-                </IndexTable.Cell>
-                <IndexTable.Cell>
-                  {group.isMultiOrder ? (
-                    <Badge tone="attention">{`${group.orders.length} Combined Separate Orders`}</Badge>
-                  ) : (
-                    <Text as="span">{primaryOrder.name}</Text>
-                  )}
-                </IndexTable.Cell>
-                <IndexTable.Cell>
-                  <Text as="span">{group.shippingAddress?.address1}{group.shippingAddress?.city ? `, ${group.shippingAddress.city}` : ""}</Text>
-                </IndexTable.Cell>
-                <IndexTable.Cell>
-                  <InlineStack gap="150">
-                    {Array.from(new Set(group.orders.map((o) => o.sourceName))).map((src) => (
-                      <ChannelBadge key={src} sourceName={src} />
-                    ))}
-                  </InlineStack>
-                </IndexTable.Cell>
-                <IndexTable.Cell>
-                  <AgingBadge agingStatus={group.worstAging} />
-                </IndexTable.Cell>
-              </IndexTable.Row>
-              
-              {/* Inline Collapsible Row Injection */}
-              {isExpanded && (
-                <tr style={{ backgroundColor: "var(--p-color-bg-surface-secondary)" }}>
-                  <td colSpan={6} style={{ padding: "16px" }}>
-                    <Box padding="400" borderBlockStartWidth="025" borderColor="border">
-                      <BlockStack gap="300">
-                        <Text as="h3" fontWeight="semibold">Consolidated Shipping Block — {group.customerName}</Text>
-                        {group.orders.map((order, i) => (
-                          <Box key={order.id}>
-                            <OrderSummaryRow order={order} indented={false} />
-                            {i < group.orders.length - 1 && <Divider />}
-                          </Box>
-                        ))}
-                      </BlockStack>
-                    </Box>
-                  </td>
-                </tr>
-              )}
-            </React.Fragment>
+                </InlineStack>
+              </IndexTable.Cell>
+              <IndexTable.Cell>
+                {group.isMultiOrder ? (
+                  <Badge tone="attention">{`${group.orders.length} Combined Separate Orders`}</Badge>
+                ) : (
+                  <Text as="span">{primaryOrder.name}</Text>
+                )}
+              </IndexTable.Cell>
+              <IndexTable.Cell>
+                <Text as="span">{group.shippingAddress?.address1}{group.shippingAddress?.city ? `, ${group.shippingAddress.city}` : ""}</Text>
+              </IndexTable.Cell>
+              <IndexTable.Cell>
+                <InlineStack gap="150">
+                  {Array.from(new Set(group.orders.map((o) => o.sourceName))).map((src) => (
+                    <ChannelBadge key={src} sourceName={src} />
+                  ))}
+                </InlineStack>
+              </IndexTable.Cell>
+              <IndexTable.Cell>
+                <AgingBadge agingStatus={group.worstAging} />
+              </IndexTable.Cell>
+            </IndexTable.Row>
           );
         })}
       </IndexTable>
+
+      {groups
+        .filter((g) => g.isMultiOrder && expandedGroups.has(g.key))
+        .map((group) => (
+          <Collapsible key={`${group.key}-detail`} open={expandedGroups.has(group.key)} id={`${group.key}-collapsible`}>
+            <Box padding="400" background="bg-surface-secondary" borderBlockStartWidth="025" borderColor="border">
+              <BlockStack gap="300">
+                <Text as="h3" fontWeight="semibold">Consolidated Shipping Block — {group.customerName}</Text>
+                {group.orders.map((order, i) => (
+                  <Box key={order.id}>
+                    <OrderSummaryRow order={order} indented />
+                    {i < group.orders.length - 1 && <Divider />}
+                  </Box>
+                ))}
+              </BlockStack>
+            </Box>
+          </Collapsible>
+        ))}
     </BlockStack>
   );
 }
@@ -600,11 +598,10 @@ export default function FulfillmentDashboard() {
 
   return (
     <PolarisProvider i18n={{}}>
-    <Page
-  fullWidth
-  title="Release Date Automated Dispatch Board"
-  subtitle="Metafield Synchronization Queue Engine (Zero Manual Tagging Active)"
->
+      <Page
+        title="Release Date Automated Dispatch Board"
+        subtitle="Metafield Synchronization Queue Engine (Zero Manual Tagging Active)"
+      >
         <Layout>
           <Layout.Section>
             <Card padding="0">
