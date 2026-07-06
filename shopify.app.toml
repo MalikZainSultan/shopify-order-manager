@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "dcf0ff631f3b80de06acf67c730c3ad5"
-application_url = "https://example.com"
+application_url = "https://shopify-order-manager.onrender.com"
 embedded = true
 name = "Order Manager"
 
@@ -17,8 +17,10 @@ api_version = "2026-04"
   topics = [ "app/uninstalled" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ 
+  "https://shopify-order-manager.onrender.com/api/auth/callback",
+  "https://shopify-order-manager.onrender.com/api/auth"
+]
 
 [build]
-include_config_on_deploy = true
 automatically_update_urls_on_dev = true
