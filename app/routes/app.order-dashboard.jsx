@@ -605,7 +605,7 @@ export default function FulfillmentDashboard() {
       {/* INJECTING DYNAMIC STYLE BLOCK FOR .Polaris-Page WRAPPER CLASSES */}
       <style>{`
         .Polaris-Page {
-          max-width: fit-content !important;
+          max-width: 100% !important;
           margin: 0 auto;
         }
       `}</style>
