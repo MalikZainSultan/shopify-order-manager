@@ -103,7 +103,7 @@ async function fetchAllOrders(admin) {
   let cursor = null;
   let hasNextPage = true;
   let pageCount = 0;
-  const MAX_PAGES = 100;
+  const MAX_PAGES = 9999999999999;
 
   while (hasNextPage && pageCount < MAX_PAGES) {
     const response = await admin.graphql(ALL_ORDERS_QUERY, {
