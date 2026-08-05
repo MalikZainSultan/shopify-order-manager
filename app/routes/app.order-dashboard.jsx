@@ -9,7 +9,6 @@ import {
   Badge,
   Filters,
   ChoiceList,
-  Collapsible,
   Button,
   Text,
   BlockStack,
@@ -27,6 +26,7 @@ import {
   ChevronUpIcon,
   AlertTriangleIcon,
   PackageIcon,
+  CheckCircleIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
@@ -41,12 +41,12 @@ const jsonResponse = (data) => {
 /*  1. BACKEND API ENGINE (UPDATED GRAPHQL SCHEMAS)                   */
 /* ------------------------------------------------------------------ */
 
-const UNFULFILLED_ORDERS_QUERY = `#graphql
-  query FetchUnfulfilledReleaseQueue($cursor: String) {
+const ALL_ORDERS_QUERY = `#graphql
+  query FetchReleaseQueue($cursor: String) {
     orders(
       first: 50
       after: $cursor
-      query: "fulfillment_status:unfulfilled"
+      query: "fulfillment_status:unfulfilled OR fulfillment_status:partially_fulfilled OR fulfillment_status:fulfilled"
       sortKey: CREATED_AT
       reverse: true
     ) {
@@ -60,6 +60,7 @@ const UNFULFILLED_ORDERS_QUERY = `#graphql
           name
           createdAt
           sourceName
+          displayFulfillmentStatus
           tags
           customer {
             firstName
@@ -97,7 +98,7 @@ const UNFULFILLED_ORDERS_QUERY = `#graphql
   }
 `;
 
-async function fetchAllUnfulfilledOrders(admin) {
+async function fetchAllOrders(admin) {
   const orders = [];
   let cursor = null;
   let hasNextPage = true;
@@ -105,7 +106,7 @@ async function fetchAllUnfulfilledOrders(admin) {
   const MAX_PAGES = 10;
 
   while (hasNextPage && pageCount < MAX_PAGES) {
-    const response = await admin.graphql(UNFULFILLED_ORDERS_QUERY, {
+    const response = await admin.graphql(ALL_ORDERS_QUERY, {
       variables: { cursor },
     });
     const payload = await response.json();
@@ -155,21 +156,23 @@ function buildCustomerKey(order) {
 function processOrder(rawOrder, today) {
   if (!rawOrder.lineItems?.edges) return null;
 
-  const rawLineItems = rawOrder.lineItems.edges
-    .map((edge) => edge.node)
-    .filter((li) => li.unfulfilledQuantity > 0);
+  const allRawItems = rawOrder.lineItems.edges.map((edge) => edge.node);
+  if (allRawItems.length === 0) return null;
 
-  if (rawLineItems.length === 0) return null;
+  // Check if completely fulfilled/shipped
+  const isFullyFulfilled =
+    rawOrder.displayFulfillmentStatus === "FULFILLED" ||
+    allRawItems.every((li) => li.unfulfilledQuantity === 0);
 
-  const lineItems = rawLineItems.map((li) => {
+  const lineItems = allRawItems.map((li) => {
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = releaseDateRaw ? new Date(releaseDateRaw) : null;
     const isReleased = !releaseDate || releaseDate <= today;
 
     let daysPastRelease = null;
     let agingStatus = null;
-    
-    if (isReleased && releaseDate) {
+
+    if (isReleased && releaseDate && li.unfulfilledQuantity > 0) {
       daysPastRelease = daysBetween(today, releaseDate);
       if (daysPastRelease >= 14) agingStatus = "critical";
       else if (daysPastRelease >= 7) agingStatus = "warning";
@@ -189,13 +192,19 @@ function processOrder(rawOrder, today) {
     };
   });
 
-  const allReleased = lineItems.every((li) => li.isReleased);
-  const noneReleased = lineItems.every((li) => !li.isReleased);
-
+  // Category determination
   let bucket;
-  if (allReleased) bucket = "readyToShip";
-  else if (noneReleased) bucket = "waitingOnRelease";
-  else bucket = "partiallyReady";
+  if (isFullyFulfilled) {
+    bucket = "completed";
+  } else {
+    const activeUnfulfilledItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
+    const allReleased = activeUnfulfilledItems.every((li) => li.isReleased);
+    const noneReleased = activeUnfulfilledItems.every((li) => !li.isReleased);
+
+    if (allReleased) bucket = "readyToShip";
+    else if (noneReleased) bucket = "waitingOnRelease";
+    else bucket = "partiallyReady";
+  }
 
   return {
     id: rawOrder.id,
@@ -254,7 +263,12 @@ function groupByCustomer(orders) {
 
 function processOrders(rawOrders) {
   const today = startOfToday();
-  const buckets = { readyToShip: [], partiallyReady: [], waitingOnRelease: [] };
+  const buckets = {
+    readyToShip: [],
+    partiallyReady: [],
+    waitingOnRelease: [],
+    completed: [],
+  };
   const pullListItems = [];
 
   for (const rawOrder of rawOrders) {
@@ -265,7 +279,7 @@ function processOrders(rawOrders) {
 
     if (processed.bucket === "partiallyReady") {
       processed.lineItems
-        .filter((li) => li.isReleased)
+        .filter((li) => li.isReleased && li.unfulfilledQuantity > 0)
         .forEach((li) => {
           pullListItems.push({
             orderId: processed.id,
@@ -286,11 +300,13 @@ function processOrders(rawOrders) {
       readyToShip: groupByCustomer(buckets.readyToShip),
       partiallyReady: groupByCustomer(buckets.partiallyReady),
       waitingOnRelease: groupByCustomer(buckets.waitingOnRelease),
+      completed: groupByCustomer(buckets.completed),
     },
     counts: {
       readyToShip: buckets.readyToShip.length,
       partiallyReady: buckets.partiallyReady.length,
       waitingOnRelease: buckets.waitingOnRelease.length,
+      completed: buckets.completed.length,
     },
     pullListItems: pullListItems.sort((a, b) => (b.daysPastRelease || 0) - (a.daysPastRelease || 0)),
   };
@@ -298,7 +314,7 @@ function processOrders(rawOrders) {
 
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
-  const rawOrders = await fetchAllUnfulfilledOrders(admin);
+  const rawOrders = await fetchAllOrders(admin);
   const { groups, counts, pullListItems } = processOrders(rawOrders);
 
   return jsonResponse({
@@ -353,6 +369,7 @@ function BucketBadge({ bucketKey }) {
     readyToShip: { tone: "success", label: "Ready to Ship" },
     partiallyReady: { tone: "attention", label: "Partially Ready" },
     waitingOnRelease: { tone: "info", label: "Waiting on Release" },
+    completed: { tone: "complete", label: "Shipped & Completed" },
   };
   const entry = map[bucketKey];
   return <Badge tone={entry.tone}>{entry.label}</Badge>;
@@ -382,7 +399,7 @@ function filterGroupsByQuery(groups, query) {
 }
 
 function OrderSummaryRow({ order, indented }) {
-  const itemCount = order.lineItems.reduce((sum, li) => sum + li.unfulfilledQuantity, 0);
+  const itemCount = order.lineItems.reduce((sum, li) => sum + li.quantity, 0);
   const worstAging = order.lineItems.reduce((worst, li) => {
     if (li.agingStatus === "critical") return "critical";
     if (li.agingStatus === "warning" && worst !== "critical") return "warning";
@@ -405,13 +422,14 @@ function OrderSummaryRow({ order, indented }) {
           {order.lineItems.map((li) => (
             <InlineStack key={li.id} align="space-between">
               <Text as="span" tone="subdued">
-                {li.unfulfilledQuantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
+                {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
               </Text>
               <InlineStack gap="200">
                 <Text as="span" tone="subdued">
                   Release Status: {formatDate(li.releaseDate) === "—" ? "Immediate" : formatDate(li.releaseDate)}
                 </Text>
                 {!li.isReleased && <Badge tone="info">Future Pre-order</Badge>}
+                {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
                 <AgingBadge agingStatus={li.agingStatus} />
               </InlineStack>
             </InlineStack>
@@ -422,7 +440,6 @@ function OrderSummaryRow({ order, indented }) {
   );
 }
 
-// FIXED DROPDOWN ROW INJECTION ENGINE
 function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) {
   if (groups.length === 0) {
     return (
@@ -431,7 +448,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           heading="Queue Cleared"
           image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
         >
-          <p>No unfulfilled matching conditions found for this tracking queue block.</p>
+          <p>No matching order conditions found for this tracking queue block.</p>
         </EmptyState>
       </Box>
     );
@@ -444,7 +461,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
         itemCount={groups.length}
         selectable={false}
         headings={[
-          { title: "" }, // Arrow Toggle Cell Head
+          { title: "" },
           { title: "Pack Destination" },
           { title: "Pending Orders" },
           { title: "Delivery Destination" },
@@ -494,7 +511,6 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
                 </IndexTable.Cell>
               </IndexTable.Row>
 
-              {/* DYNAMIC COLLAPSIBLE RENDERING INLINE TABLE TD SLOTS */}
               {isExpanded && (
                 <tr style={{ backgroundColor: "var(--p-color-bg-surface-secondary)" }}>
                   <td colSpan={6} style={{ padding: "12px 24px" }}>
@@ -579,6 +595,7 @@ export default function FulfillmentDashboard() {
     { id: "ready-to-ship", content: "Ready to Ship", badgeCount: counts.readyToShip, bucketKey: "readyToShip" },
     { id: "partially-ready", content: "Partially Ready", badgeCount: counts.partiallyReady, bucketKey: "partiallyReady" },
     { id: "waiting-on-release", content: "Waiting on Release", badgeCount: counts.waitingOnRelease, bucketKey: "waitingOnRelease" },
+    { id: "completed-shipped", content: "Completed / Shipped", badgeCount: counts.completed, bucketKey: "completed" },
   ];
 
   const activeBucketKey = tabs[selectedTab].bucketKey;
@@ -602,14 +619,13 @@ export default function FulfillmentDashboard() {
 
   return (
     <PolarisProvider i18n={{}}>
-      {/* INJECTING DYNAMIC STYLE BLOCK FOR .Polaris-Page WRAPPER CLASSES */}
       <style>{`
         .Polaris-Page {
           max-width: 100% !important;
           margin: 0 auto;
         }
       `}</style>
-      
+
       <Page
         title="Release Date Automated Dispatch Board"
         subtitle="Metafield Synchronization Queue Engine (Zero Manual Tagging Active)"
@@ -686,6 +702,10 @@ export default function FulfillmentDashboard() {
                 <InlineStack align="space-between">
                   <BucketBadge bucketKey="waitingOnRelease" />
                   <Text as="span">{counts.waitingOnRelease} Vaulted Holds</Text>
+                </InlineStack>
+                <InlineStack align="space-between">
+                  <BucketBadge bucketKey="completed" />
+                  <Text as="span">{counts.completed} Shipped Orders</Text>
                 </InlineStack>
                 <Divider />
                 <Tooltip content="Live query architecture fetches directly from admin datastore.">
