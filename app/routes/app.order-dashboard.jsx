@@ -38,15 +38,15 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. BACKEND API ENGINE (RELIABLE GRAPHQL QUERY)                    */
+/*  1. UNLIMITED GRAPHQL FETCHING ENGINE (ALL OPEN ORDERS FETCH)     */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
   query FetchReleaseQueue($cursor: String) {
     orders(
-      first: 50
+      first: 250
       after: $cursor
-      query: "status:open OR status:closed"
+      query: "status:open"
       sortKey: CREATED_AT
       reverse: true
     ) {
@@ -102,10 +102,9 @@ async function fetchAllOrders(admin) {
   const orders = [];
   let cursor = null;
   let hasNextPage = true;
-  let pageCount = 0;
-  const MAX_PAGES = 50; // Protects API limits while guaranteeing deep history retrieval
 
-  while (hasNextPage && pageCount < MAX_PAGES) {
+  // Jab tak saare open orders fetch nahi ho jaate, tab tak loop chalta rahega
+  while (hasNextPage) {
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
         variables: { cursor },
@@ -124,7 +123,6 @@ async function fetchAllOrders(admin) {
 
       hasNextPage = ordersConnection?.pageInfo?.hasNextPage || false;
       cursor = ordersConnection?.pageInfo?.endCursor || null;
-      pageCount += 1;
     } catch (err) {
       console.error("Pipeline Fetch Error:", err);
       break;
