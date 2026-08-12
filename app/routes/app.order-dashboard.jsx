@@ -27,7 +27,7 @@ import {
   AlertTriangleIcon,
   PackageIcon,
   CheckCircleIcon,
-  CancelSmallIcon,
+  XIcon,
   SearchIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
@@ -447,7 +447,7 @@ function OrderSummaryRow({ order, indented }) {
           <ChannelBadge sourceName={order.sourceName} />
           <Text as="span" tone="subdued">Placed: {formatDate(order.createdAt)}</Text>
           {order.isCancelled && (
-            <Badge tone="critical" icon={CancelSmallIcon}>
+            <Badge tone="critical" icon={XIcon}>
               Cancelled ({formatDate(order.cancelledAt)})
             </Badge>
           )}
@@ -552,7 +552,11 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
                   </InlineStack>
                 </IndexTable.Cell>
                 <IndexTable.Cell>
-                  <AgingBadge agingStatus={group.worstAging} />
+                  {bucketKey === "cancelled" ? (
+                    <Badge tone="critical">Cancelled</Badge>
+                  ) : (
+                    <AgingBadge agingStatus={group.worstAging} />
+                  )}
                 </IndexTable.Cell>
               </IndexTable.Row>
 
@@ -647,7 +651,6 @@ export default function FulfillmentDashboard() {
 
   const activeBucketKey = tabs[selectedTab].bucketKey;
 
-  // Global Search Feature: Jab search box mein input ho, toh tab isolation bypass ho kar Global Store Query chalegi
   const filteredGroups = useMemo(() => {
     const isSearching = Boolean(queryValue.trim());
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
