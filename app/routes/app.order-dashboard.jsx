@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useCallback } from "react";
-import { useLoaderData } from "react-router";
+import { useLoaderData } from "@remix-run/react";
 import {
   Page,
   Layout,
@@ -38,7 +38,7 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. BACKEND API ENGINE (UPDATED GRAPHQL SCHEMAS)                   */
+/*  1. BACKEND API ENGINE (RELIABLE GRAPHQL QUERY)                    */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
@@ -46,7 +46,7 @@ const ALL_ORDERS_QUERY = `#graphql
     orders(
       first: 50
       after: $cursor
-      query: "fulfillment_status:unfulfilled OR fulfillment_status:partially_fulfilled OR fulfillment_status:fulfilled"
+      query: "status:open OR status:closed"
       sortKey: CREATED_AT
       reverse: true
     ) {
@@ -103,26 +103,32 @@ async function fetchAllOrders(admin) {
   let cursor = null;
   let hasNextPage = true;
   let pageCount = 0;
-  const MAX_PAGES = 999;
+  const MAX_PAGES = 50; // Protects API limits while guaranteeing deep history retrieval
 
   while (hasNextPage && pageCount < MAX_PAGES) {
-    const response = await admin.graphql(ALL_ORDERS_QUERY, {
-      variables: { cursor },
-    });
-    const payload = await response.json();
+    try {
+      const response = await admin.graphql(ALL_ORDERS_QUERY, {
+        variables: { cursor },
+      });
+      const payload = await response.json();
 
-    if (payload.errors) {
-      throw new Response(JSON.stringify(payload.errors), { status: 500 });
+      if (payload.errors) {
+        console.error("GraphQL Execution Errors:", payload.errors);
+        break;
+      }
+
+      const ordersConnection = payload.data?.orders;
+      if (ordersConnection?.edges) {
+        orders.push(...ordersConnection.edges.map((edge) => edge.node));
+      }
+
+      hasNextPage = ordersConnection?.pageInfo?.hasNextPage || false;
+      cursor = ordersConnection?.pageInfo?.endCursor || null;
+      pageCount += 1;
+    } catch (err) {
+      console.error("Pipeline Fetch Error:", err);
+      break;
     }
-
-    const ordersConnection = payload.data.orders;
-    if (ordersConnection?.edges) {
-      orders.push(...ordersConnection.edges.map((edge) => edge.node));
-    }
-
-    hasNextPage = ordersConnection?.pageInfo?.hasNextPage || false;
-    cursor = ordersConnection?.pageInfo?.endCursor || null;
-    pageCount += 1;
   }
 
   return orders;
@@ -148,9 +154,10 @@ function buildCustomerKey(order) {
   const c = order.customer;
   const email = order.email;
   const a = order.shippingAddress;
-  return [c?.firstName, c?.lastName, email, a?.address1, a?.zip]
+  const key = [c?.firstName, c?.lastName, email, a?.address1, a?.zip]
     .map((part) => (part || "").toString().trim().toLowerCase())
     .join("|");
+  return key.replace(/\|+/g, "|") === "|" ? `guest-${order.id}` : key;
 }
 
 function processOrder(rawOrder, today) {
@@ -192,7 +199,10 @@ function processOrder(rawOrder, today) {
     };
   });
 
-  // Category determination
+  // Check if order has any unfulfilled items left
+  const hasUnfulfilled = lineItems.some((li) => li.unfulfilledQuantity > 0);
+
+  // Bucket Category determination
   let bucket;
   if (isFullyFulfilled) {
     bucket = "completed";
@@ -217,6 +227,7 @@ function processOrder(rawOrder, today) {
     shippingAddress: rawOrder.shippingAddress,
     lineItems,
     bucket,
+    hasUnfulfilled,
     customerKey: buildCustomerKey(rawOrder),
   };
 }
@@ -264,6 +275,7 @@ function groupByCustomer(orders) {
 function processOrders(rawOrders) {
   const today = startOfToday();
   const buckets = {
+    allUnfulfilled: [],
     readyToShip: [],
     partiallyReady: [],
     waitingOnRelease: [],
@@ -274,6 +286,11 @@ function processOrders(rawOrders) {
   for (const rawOrder of rawOrders) {
     const processed = processOrder(rawOrder, today);
     if (!processed) continue;
+
+    // Collect into main unfulfilled bucket if applicable
+    if (processed.hasUnfulfilled) {
+      buckets.allUnfulfilled.push(processed);
+    }
 
     buckets[processed.bucket].push(processed);
 
@@ -297,12 +314,14 @@ function processOrders(rawOrders) {
 
   return {
     groups: {
+      allUnfulfilled: groupByCustomer(buckets.allUnfulfilled),
       readyToShip: groupByCustomer(buckets.readyToShip),
       partiallyReady: groupByCustomer(buckets.partiallyReady),
       waitingOnRelease: groupByCustomer(buckets.waitingOnRelease),
       completed: groupByCustomer(buckets.completed),
     },
     counts: {
+      allUnfulfilled: buckets.allUnfulfilled.length,
       readyToShip: buckets.readyToShip.length,
       partiallyReady: buckets.partiallyReady.length,
       waitingOnRelease: buckets.waitingOnRelease.length,
@@ -366,13 +385,14 @@ function AgingBadge({ agingStatus }) {
 
 function BucketBadge({ bucketKey }) {
   const map = {
+    allUnfulfilled: { tone: "attention", label: "All Unfulfilled Queue" },
     readyToShip: { tone: "success", label: "Ready to Ship" },
     partiallyReady: { tone: "attention", label: "Partially Ready" },
     waitingOnRelease: { tone: "info", label: "Waiting on Release" },
     completed: { tone: "complete", label: "Shipped & Completed" },
   };
   const entry = map[bucketKey];
-  return <Badge tone={entry.tone}>{entry.label}</Badge>;
+  return <Badge tone={entry?.tone}>{entry?.label}</Badge>;
 }
 
 function filterGroupsByChannel(groups, selectedChannels) {
@@ -422,7 +442,7 @@ function OrderSummaryRow({ order, indented }) {
           {order.lineItems.map((li) => (
             <InlineStack key={li.id} align="space-between">
               <Text as="span" tone="subdued">
-                {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
+                {li.unfulfilledQuantity} of {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
               </Text>
               <InlineStack gap="200">
                 <Text as="span" tone="subdued">
@@ -430,6 +450,7 @@ function OrderSummaryRow({ order, indented }) {
                 </Text>
                 {!li.isReleased && <Badge tone="info">Future Pre-order</Badge>}
                 {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
+                {li.unfulfilledQuantity > 0 && li.isReleased && <Badge tone="attention">Pending Pickup</Badge>}
                 <AgingBadge agingStatus={li.agingStatus} />
               </InlineStack>
             </InlineStack>
@@ -592,6 +613,7 @@ export default function FulfillmentDashboard() {
   }, []);
 
   const tabs = [
+    { id: "all-unfulfilled", content: "Unfulfilled Orders", badgeCount: counts.allUnfulfilled, bucketKey: "allUnfulfilled" },
     { id: "ready-to-ship", content: "Ready to Ship", badgeCount: counts.readyToShip, bucketKey: "readyToShip" },
     { id: "partially-ready", content: "Partially Ready", badgeCount: counts.partiallyReady, bucketKey: "partiallyReady" },
     { id: "waiting-on-release", content: "Waiting on Release", badgeCount: counts.waitingOnRelease, bucketKey: "waitingOnRelease" },
@@ -663,7 +685,7 @@ export default function FulfillmentDashboard() {
                     appliedFilters={appliedFilters}
                   />
 
-                  {selectedTab === 1 && (
+                  {selectedTab === 2 && (
                     <Banner tone="warning" icon={PackageIcon}>
                       <Text as="p" fontWeight="semibold">Warehouse Extract / Harvest Pull List</Text>
                       <Text as="p">Extract these line items from storage racks immediately. They are physically released but bound inside composite pre-order allocations.</Text>
@@ -690,6 +712,10 @@ export default function FulfillmentDashboard() {
                 <InlineStack gap="200" blockAlign="center">
                   <Icon source={PackageIcon} tone="base" />
                   <Text as="h3" fontWeight="semibold">Realtime Fulfillment Metrics</Text>
+                </InlineStack>
+                <InlineStack align="space-between">
+                  <BucketBadge bucketKey="allUnfulfilled" />
+                  <Text as="span">{counts.allUnfulfilled} Total Pending</Text>
                 </InlineStack>
                 <InlineStack align="space-between">
                   <BucketBadge bucketKey="readyToShip" />
