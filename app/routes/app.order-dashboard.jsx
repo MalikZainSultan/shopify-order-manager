@@ -27,6 +27,8 @@ import {
   AlertTriangleIcon,
   PackageIcon,
   CheckCircleIcon,
+  CancelSmallIcon,
+  SearchIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
@@ -38,7 +40,7 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FETCHING ENGINE (ALL OPEN ORDERS FETCH)     */
+/*  1. UNLIMITED GRAPHQL FETCHING ENGINE                              */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
@@ -46,7 +48,7 @@ const ALL_ORDERS_QUERY = `#graphql
     orders(
       first: 250
       after: $cursor
-      query: "status:open"
+      query: "status:open OR status:cancelled OR status:closed"
       sortKey: CREATED_AT
       reverse: true
     ) {
@@ -59,6 +61,8 @@ const ALL_ORDERS_QUERY = `#graphql
           id
           name
           createdAt
+          cancelledAt
+          cancelReason
           sourceName
           displayFulfillmentStatus
           tags
@@ -75,7 +79,7 @@ const ALL_ORDERS_QUERY = `#graphql
             zip
             country
           }
-          lineItems(first: 100) {
+          lineItems(first: 250) {
             edges {
               node {
                 id
@@ -103,7 +107,6 @@ async function fetchAllOrders(admin) {
   let cursor = null;
   let hasNextPage = true;
 
-  // Jab tak saare open orders fetch nahi ho jaate, tab tak loop chalta rahega
   while (hasNextPage) {
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
@@ -133,7 +136,7 @@ async function fetchAllOrders(admin) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  2. ALGORITHMIC DATA PROCESSING & STRATIFICATION RUNTIME           */
+/*  2. ALGORITHMIC DATA PROCESSING RUNTIME                           */
 /* ------------------------------------------------------------------ */
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
@@ -164,7 +167,8 @@ function processOrder(rawOrder, today) {
   const allRawItems = rawOrder.lineItems.edges.map((edge) => edge.node);
   if (allRawItems.length === 0) return null;
 
-  // Check if completely fulfilled/shipped
+  const isCancelled = Boolean(rawOrder.cancelledAt);
+
   const isFullyFulfilled =
     rawOrder.displayFulfillmentStatus === "FULFILLED" ||
     allRawItems.every((li) => li.unfulfilledQuantity === 0);
@@ -177,7 +181,7 @@ function processOrder(rawOrder, today) {
     let daysPastRelease = null;
     let agingStatus = null;
 
-    if (isReleased && releaseDate && li.unfulfilledQuantity > 0) {
+    if (isReleased && releaseDate && li.unfulfilledQuantity > 0 && !isCancelled) {
       daysPastRelease = daysBetween(today, releaseDate);
       if (daysPastRelease >= 14) agingStatus = "critical";
       else if (daysPastRelease >= 7) agingStatus = "warning";
@@ -197,12 +201,12 @@ function processOrder(rawOrder, today) {
     };
   });
 
-  // Check if order has any unfulfilled items left
-  const hasUnfulfilled = lineItems.some((li) => li.unfulfilledQuantity > 0);
+  const hasUnfulfilled = lineItems.some((li) => li.unfulfilledQuantity > 0) && !isCancelled;
 
-  // Bucket Category determination
   let bucket;
-  if (isFullyFulfilled) {
+  if (isCancelled) {
+    bucket = "cancelled";
+  } else if (isFullyFulfilled) {
     bucket = "completed";
   } else {
     const activeUnfulfilledItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
@@ -218,6 +222,8 @@ function processOrder(rawOrder, today) {
     id: rawOrder.id,
     name: rawOrder.name,
     createdAt: rawOrder.createdAt,
+    cancelledAt: rawOrder.cancelledAt,
+    cancelReason: rawOrder.cancelReason,
     sourceName: (rawOrder.sourceName || "shopify").toLowerCase(),
     tags: rawOrder.tags || [],
     customer: rawOrder.customer,
@@ -226,6 +232,7 @@ function processOrder(rawOrder, today) {
     lineItems,
     bucket,
     hasUnfulfilled,
+    isCancelled,
     customerKey: buildCustomerKey(rawOrder),
   };
 }
@@ -278,14 +285,17 @@ function processOrders(rawOrders) {
     partiallyReady: [],
     waitingOnRelease: [],
     completed: [],
+    cancelled: [],
   };
   const pullListItems = [];
+  const allOrdersList = [];
 
   for (const rawOrder of rawOrders) {
     const processed = processOrder(rawOrder, today);
     if (!processed) continue;
 
-    // Collect into main unfulfilled bucket if applicable
+    allOrdersList.push(processed);
+
     if (processed.hasUnfulfilled) {
       buckets.allUnfulfilled.push(processed);
     }
@@ -311,12 +321,14 @@ function processOrders(rawOrders) {
   }
 
   return {
+    allOrdersGrouped: groupByCustomer(allOrdersList),
     groups: {
       allUnfulfilled: groupByCustomer(buckets.allUnfulfilled),
       readyToShip: groupByCustomer(buckets.readyToShip),
       partiallyReady: groupByCustomer(buckets.partiallyReady),
       waitingOnRelease: groupByCustomer(buckets.waitingOnRelease),
       completed: groupByCustomer(buckets.completed),
+      cancelled: groupByCustomer(buckets.cancelled),
     },
     counts: {
       allUnfulfilled: buckets.allUnfulfilled.length,
@@ -324,6 +336,7 @@ function processOrders(rawOrders) {
       partiallyReady: buckets.partiallyReady.length,
       waitingOnRelease: buckets.waitingOnRelease.length,
       completed: buckets.completed.length,
+      cancelled: buckets.cancelled.length,
     },
     pullListItems: pullListItems.sort((a, b) => (b.daysPastRelease || 0) - (a.daysPastRelease || 0)),
   };
@@ -332,9 +345,10 @@ function processOrders(rawOrders) {
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const rawOrders = await fetchAllOrders(admin);
-  const { groups, counts, pullListItems } = processOrders(rawOrders);
+  const { allOrdersGrouped, groups, counts, pullListItems } = processOrders(rawOrders);
 
   return jsonResponse({
+    allOrdersGrouped,
     groups,
     counts,
     pullListItems,
@@ -388,6 +402,7 @@ function BucketBadge({ bucketKey }) {
     partiallyReady: { tone: "attention", label: "Partially Ready" },
     waitingOnRelease: { tone: "info", label: "Waiting on Release" },
     completed: { tone: "complete", label: "Shipped & Completed" },
+    cancelled: { tone: "critical", label: "Cancelled Orders" },
   };
   const entry = map[bucketKey];
   return <Badge tone={entry?.tone}>{entry?.label}</Badge>;
@@ -430,8 +445,13 @@ function OrderSummaryRow({ order, indented }) {
         <InlineStack gap="300" blockAlign="center">
           <Text as="span" fontWeight="semibold">{order.name}</Text>
           <ChannelBadge sourceName={order.sourceName} />
-          <Text as="span" tone="subdued">{formatDate(order.createdAt)}</Text>
-          <Text as="span" tone="subdued">{itemCount} Allocated Item(s)</Text>
+          <Text as="span" tone="subdued">Placed: {formatDate(order.createdAt)}</Text>
+          {order.isCancelled && (
+            <Badge tone="critical" icon={CancelSmallIcon}>
+              Cancelled ({formatDate(order.cancelledAt)})
+            </Badge>
+          )}
+          <Text as="span" tone="subdued">{itemCount} Item(s)</Text>
         </InlineStack>
         <AgingBadge agingStatus={worstAging} />
       </InlineStack>
@@ -446,9 +466,15 @@ function OrderSummaryRow({ order, indented }) {
                 <Text as="span" tone="subdued">
                   Release Status: {formatDate(li.releaseDate) === "—" ? "Immediate" : formatDate(li.releaseDate)}
                 </Text>
-                {!li.isReleased && <Badge tone="info">Future Pre-order</Badge>}
-                {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
-                {li.unfulfilledQuantity > 0 && li.isReleased && <Badge tone="attention">Pending Pickup</Badge>}
+                {order.isCancelled ? (
+                  <Badge tone="critical">Voided</Badge>
+                ) : (
+                  <>
+                    {!li.isReleased && <Badge tone="info">Future Pre-order</Badge>}
+                    {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
+                    {li.unfulfilledQuantity > 0 && li.isReleased && <Badge tone="attention">Pending Pickup</Badge>}
+                  </>
+                )}
                 <AgingBadge agingStatus={li.agingStatus} />
               </InlineStack>
             </InlineStack>
@@ -464,10 +490,10 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
     return (
       <Box paddingBlock="800">
         <EmptyState
-          heading="Queue Cleared"
+          heading="Queue Cleared / No Matching Results"
           image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
         >
-          <p>No matching order conditions found for this tracking queue block.</p>
+          <p>No matching order records found across the database query criteria.</p>
         </EmptyState>
       </Box>
     );
@@ -485,7 +511,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           { title: "Pending Orders" },
           { title: "Delivery Destination" },
           { title: "Marketplace Track" },
-          { title: "Aging Threshold" },
+          { title: "Aging / Status" },
         ]}
       >
         {groups.map((group, index) => {
@@ -494,7 +520,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
 
           return (
             <React.Fragment key={group.key}>
-              <IndexTable.Row id={group.key} position={index} tone={group.isMultiOrder ? "subdued" : undefined}>
+              <IndexTable.Row id={group.key} key={group.key} position={index} tone={group.isMultiOrder ? "subdued" : undefined}>
                 <IndexTable.Cell>
                   <Button
                     variant="tertiary"
@@ -512,7 +538,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
                   {group.isMultiOrder ? (
                     <Badge tone="attention">{`${group.orders.length} Combined Separate Orders`}</Badge>
                   ) : (
-                    <Text as="span">{primaryOrder.name}</Text>
+                    <Text as="span">{primaryOrder?.name}</Text>
                   )}
                 </IndexTable.Cell>
                 <IndexTable.Cell>
@@ -594,7 +620,7 @@ function PullListTable({ items }) {
 }
 
 export default function FulfillmentDashboard() {
-  const { groups, counts, pullListItems, fetchedAt } = useLoaderData();
+  const { allOrdersGrouped, groups, counts, pullListItems, fetchedAt } = useLoaderData();
 
   const [selectedTab, setSelectedTab] = useState(0);
   const [channelFilter, setChannelFilter] = useState([]);
@@ -616,15 +642,18 @@ export default function FulfillmentDashboard() {
     { id: "partially-ready", content: "Partially Ready", badgeCount: counts.partiallyReady, bucketKey: "partiallyReady" },
     { id: "waiting-on-release", content: "Waiting on Release", badgeCount: counts.waitingOnRelease, bucketKey: "waitingOnRelease" },
     { id: "completed-shipped", content: "Completed / Shipped", badgeCount: counts.completed, bucketKey: "completed" },
+    { id: "cancelled-orders", content: "Cancelled Orders", badgeCount: counts.cancelled, bucketKey: "cancelled" },
   ];
 
   const activeBucketKey = tabs[selectedTab].bucketKey;
 
+  // Global Search Feature: Jab search box mein input ho, toh tab isolation bypass ho kar Global Store Query chalegi
   const filteredGroups = useMemo(() => {
-    const base = groups[activeBucketKey] || [];
+    const isSearching = Boolean(queryValue.trim());
+    const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
     const byChannel = filterGroupsByChannel(base, channelFilter);
     return filterGroupsByQuery(byChannel, queryValue);
-  }, [groups, activeBucketKey, channelFilter, queryValue]);
+  }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue]);
 
   const filteredPullListItems = useMemo(() => {
     if (channelFilter.length === 0) return pullListItems;
@@ -662,7 +691,7 @@ export default function FulfillmentDashboard() {
                 <BlockStack gap="400">
                   <Filters
                     queryValue={queryValue}
-                    queryPlaceholder="Search dynamic records by buyer or order number..."
+                    queryPlaceholder="Global Search: Type Order # or Customer Name across ALL tabs..."
                     onQueryChange={setQueryValue}
                     onQueryClear={() => setQueryValue("")}
                     onClearAll={() => { setQueryValue(""); setChannelFilter([]); }}
@@ -683,7 +712,15 @@ export default function FulfillmentDashboard() {
                     appliedFilters={appliedFilters}
                   />
 
-                  {selectedTab === 2 && (
+                  {queryValue.trim() && (
+                    <Banner tone="info" icon={SearchIcon}>
+                      <Text as="p" fontWeight="bold">
+                        Global Search Active: Showing results matching "{queryValue}" across ALL tabs and status categories.
+                      </Text>
+                    </Banner>
+                  )}
+
+                  {selectedTab === 2 && !queryValue.trim() && (
                     <Banner tone="warning" icon={PackageIcon}>
                       <Text as="p" fontWeight="semibold">Warehouse Extract / Harvest Pull List</Text>
                       <Text as="p">Extract these line items from storage racks immediately. They are physically released but bound inside composite pre-order allocations.</Text>
@@ -730,6 +767,10 @@ export default function FulfillmentDashboard() {
                 <InlineStack align="space-between">
                   <BucketBadge bucketKey="completed" />
                   <Text as="span">{counts.completed} Shipped Orders</Text>
+                </InlineStack>
+                <InlineStack align="space-between">
+                  <BucketBadge bucketKey="cancelled" />
+                  <Text as="span">{counts.cancelled} Cancelled Orders</Text>
                 </InlineStack>
                 <Divider />
                 <Tooltip content="Live query architecture fetches directly from admin datastore.">
