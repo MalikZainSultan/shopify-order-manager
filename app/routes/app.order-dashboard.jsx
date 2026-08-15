@@ -29,6 +29,7 @@ import {
   CheckCircleIcon,
   XIcon,
   SearchIcon,
+  CalendarIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
@@ -89,7 +90,11 @@ const ALL_ORDERS_QUERY = `#graphql
                 unfulfilledQuantity
                 product {
                   id
+                  tags
                   metafield(namespace: "custom", key: "release_date") {
+                    value
+                  }
+                  focMetafield: metafield(namespace: "custom", key: "foc_date") {
                     value
                   }
                 }
@@ -136,7 +141,7 @@ async function fetchAllOrders(admin) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  2. ALGORITHMIC DATA PROCESSING RUNTIME                           */
+/*  2. ALGORITHMIC DATA PROCESSING RUNTIME                            */
 /* ------------------------------------------------------------------ */
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
@@ -149,6 +154,20 @@ function startOfToday() {
 
 function daysBetween(later, earlier) {
   return Math.floor((later.getTime() - earlier.getTime()) / MS_PER_DAY);
+}
+
+function extractFocDate(productTags = [], productFocMetafield = null) {
+  if (productFocMetafield) return productFocMetafield;
+  
+  const tagList = Array.isArray(productTags) ? productTags : [];
+  const focTag = tagList.find((t) => t.toLowerCase().startsWith("foc-"));
+  if (focTag) {
+    const rawDate = focTag.substring(4).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+      return rawDate;
+    }
+  }
+  return null;
 }
 
 function buildCustomerKey(order) {
@@ -178,6 +197,8 @@ function processOrder(rawOrder, today) {
     const releaseDate = releaseDateRaw ? new Date(releaseDateRaw) : null;
     const isReleased = !releaseDate || releaseDate <= today;
 
+    const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
+
     let daysPastRelease = null;
     let agingStatus = null;
 
@@ -195,6 +216,7 @@ function processOrder(rawOrder, today) {
       unfulfilledQuantity: li.unfulfilledQuantity,
       productId: li.product?.id || null,
       releaseDate: releaseDateRaw,
+      focDate: focDateRaw,
       isReleased,
       daysPastRelease,
       agingStatus,
@@ -277,6 +299,54 @@ function groupByCustomer(orders) {
     });
 }
 
+function buildFocPullList(waitingOrders) {
+  const focMap = new Map();
+
+  for (const order of waitingOrders) {
+    for (const item of order.lineItems) {
+      if (item.unfulfilledQuantity > 0 && !item.isReleased) {
+        const focKey = item.focDate || "No FOC Date Assigned";
+        if (!focMap.has(focKey)) {
+          focMap.set(focKey, new Map());
+        }
+
+        const dateGroup = focMap.get(focKey);
+        const itemKey = `${item.title}-${item.variantTitle || ""}`;
+
+        if (!dateGroup.has(itemKey)) {
+          dateGroup.set(itemKey, {
+            title: item.title,
+            variantTitle: item.variantTitle,
+            quantity: 0,
+            releaseDate: item.releaseDate,
+            focDate: item.focDate,
+            orders: [],
+          });
+        }
+
+        const existing = dateGroup.get(itemKey);
+        existing.quantity += item.unfulfilledQuantity;
+        existing.orders.push({
+          orderName: order.name,
+          sourceName: order.sourceName,
+          customer: `${order.customer?.firstName || ""} ${order.customer?.lastName || ""}`.trim() || "Buyer",
+        });
+      }
+    }
+  }
+
+  return Array.from(focMap.entries())
+    .map(([focDate, itemsMap]) => ({
+      focDate,
+      items: Array.from(itemsMap.values()),
+    }))
+    .sort((a, b) => {
+      if (a.focDate === "No FOC Date Assigned") return 1;
+      if (b.focDate === "No FOC Date Assigned") return -1;
+      return new Date(a.focDate) - new Date(b.focDate);
+    });
+}
+
 function processOrders(rawOrders) {
   const today = startOfToday();
   const buckets = {
@@ -320,6 +390,8 @@ function processOrders(rawOrders) {
     }
   }
 
+  const focPullList = buildFocPullList(buckets.waitingOnRelease);
+
   return {
     allOrdersGrouped: groupByCustomer(allOrdersList),
     groups: {
@@ -339,19 +411,21 @@ function processOrders(rawOrders) {
       cancelled: buckets.cancelled.length,
     },
     pullListItems: pullListItems.sort((a, b) => (b.daysPastRelease || 0) - (a.daysPastRelease || 0)),
+    focPullList,
   };
 }
 
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const rawOrders = await fetchAllOrders(admin);
-  const { allOrdersGrouped, groups, counts, pullListItems } = processOrders(rawOrders);
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processOrders(rawOrders);
 
   return jsonResponse({
     allOrdersGrouped,
     groups,
     counts,
     pullListItems,
+    focPullList,
     fetchedAt: new Date().toISOString(),
   });
 };
@@ -463,6 +537,7 @@ function OrderSummaryRow({ order, indented }) {
                 {li.unfulfilledQuantity} of {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
               </Text>
               <InlineStack gap="200">
+                {li.focDate && <Badge tone="info">FOC: {li.focDate}</Badge>}
                 <Text as="span" tone="subdued">
                   Release Status: {formatDate(li.releaseDate) === "—" ? "Immediate" : formatDate(li.releaseDate)}
                 </Text>
@@ -623,8 +698,65 @@ function PullListTable({ items }) {
   );
 }
 
+function FocPullListView({ focGroups }) {
+  if (!focGroups || focGroups.length === 0) {
+    return <Banner tone="info">No future FOC pre-order items pending order placement.</Banner>;
+  }
+
+  return (
+    <BlockStack gap="400">
+      {focGroups.map((group) => (
+        <Card key={group.focDate} padding="400">
+          <BlockStack gap="300">
+            <InlineStack align="space-between" blockAlign="center">
+              <InlineStack gap="200" blockAlign="center">
+                <Icon source={CalendarIcon} tone="base" />
+                <Text as="h3" variant="headingMd" fontWeight="bold">
+                  FOC Order Deadline: {group.focDate === "No FOC Date Assigned" ? "Unassigned FOC" : formatDate(group.focDate)}
+                </Text>
+              </InlineStack>
+              <Badge tone="attention">{`${group.items.reduce((s, i) => s + i.quantity, 0)} Total Units to Order`}</Badge>
+            </InlineStack>
+
+            <IndexTable
+              resourceName={{ singular: "FOC item", plural: "FOC items" }}
+              itemCount={group.items.length}
+              selectable={false}
+              headings={[
+                { title: "Physical Product Component (Quantity Needed)" },
+                { title: "Release Date" },
+                { title: "Order References" },
+              ]}
+            >
+              {group.items.map((item, idx) => (
+                <IndexTable.Row id={`${group.focDate}-${idx}`} key={`${group.focDate}-${idx}`} position={idx}>
+                  <IndexTable.Cell>
+                    <Text as="span" fontWeight="bold">{item.quantity}x </Text>
+                    <Text as="span" fontWeight="semibold">{item.title}</Text>
+                    {item.variantTitle && <Text as="span" tone="subdued"> — {item.variantTitle}</Text>}
+                  </IndexTable.Cell>
+                  <IndexTable.Cell>{formatDate(item.releaseDate)}</IndexTable.Cell>
+                  <IndexTable.Cell>
+                    <InlineStack gap="100">
+                      {item.orders.map((o, oIdx) => (
+                        <Tooltip key={oIdx} content={`${o.customer} (${o.sourceName})`}>
+                          <Badge tone="info">{o.orderName}</Badge>
+                        </Tooltip>
+                      ))}
+                    </InlineStack>
+                  </IndexTable.Cell>
+                </IndexTable.Row>
+              ))}
+            </IndexTable>
+          </BlockStack>
+        </Card>
+      ))}
+    </BlockStack>
+  );
+}
+
 export default function FulfillmentDashboard() {
-  const { allOrdersGrouped, groups, counts, pullListItems, fetchedAt } = useLoaderData();
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt } = useLoaderData();
 
   const [selectedTab, setSelectedTab] = useState(0);
   const [channelFilter, setChannelFilter] = useState([]);
@@ -731,6 +863,16 @@ export default function FulfillmentDashboard() {
                         <PullListTable items={filteredPullListItems} />
                       </Box>
                     </Banner>
+                  )}
+
+                  {selectedTab === 3 && !queryValue.trim() && (
+                    <BlockStack gap="300">
+                      <Banner tone="info" icon={CalendarIcon}>
+                        <Text as="p" fontWeight="semibold">FOC Weekly Ordering Pull List</Text>
+                        <Text as="p">All unreleased items grouped by their FOC (Final Order Cutoff) deadline for vendor order placement.</Text>
+                      </Banner>
+                      <FocPullListView focGroups={focPullList} />
+                    </BlockStack>
                   )}
 
                   <BucketIndexTable
