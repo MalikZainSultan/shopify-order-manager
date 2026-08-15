@@ -33,7 +33,6 @@ import {
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
-// React Router Native Data Pipeline Wrapper
 const jsonResponse = (data) => {
   return new Response(JSON.stringify(data), {
     headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -41,15 +40,14 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FETCHING ENGINE                              */
+/*  1. UNLIMITED GRAPHQL FETCHING ENGINE (ALL ORDERS, NO LIMIT)       */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
   query FetchReleaseQueue($cursor: String) {
     orders(
-      first: 250
+      first: 50
       after: $cursor
-      query: "status:open OR status:cancelled OR status:closed"
       sortKey: CREATED_AT
       reverse: true
     ) {
@@ -64,8 +62,8 @@ const ALL_ORDERS_QUERY = `#graphql
           createdAt
           cancelledAt
           cancelReason
-          sourceName
           displayFulfillmentStatus
+          displayFinancialStatus
           tags
           customer {
             firstName
@@ -80,7 +78,7 @@ const ALL_ORDERS_QUERY = `#graphql
             zip
             country
           }
-          lineItems(first: 250) {
+          lineItems(first: 50) {
             edges {
               node {
                 id
@@ -120,7 +118,7 @@ async function fetchAllOrders(admin) {
       const payload = await response.json();
 
       if (payload.errors) {
-        console.error("GraphQL Execution Errors:", payload.errors);
+        console.error("GraphQL Execution Errors:", JSON.stringify(payload.errors, null, 2));
         break;
       }
 
@@ -141,7 +139,7 @@ async function fetchAllOrders(admin) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  2. ALGORITHMIC DATA PROCESSING RUNTIME                            */
+/*  2. DATA PROCESSING & GROUPING RUNTIME                             */
 /* ------------------------------------------------------------------ */
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
@@ -168,6 +166,13 @@ function extractFocDate(productTags = [], productFocMetafield = null) {
     }
   }
   return null;
+}
+
+function detectChannel(order) {
+  const tagList = Array.isArray(order.tags) ? order.tags.map((t) => t.toLowerCase()) : [];
+  if (tagList.some((t) => t.includes("ebay"))) return "ebay";
+  if (tagList.some((t) => t.includes("whatnot"))) return "whatnot";
+  return "shopify";
 }
 
 function buildCustomerKey(order) {
@@ -246,7 +251,7 @@ function processOrder(rawOrder, today) {
     createdAt: rawOrder.createdAt,
     cancelledAt: rawOrder.cancelledAt,
     cancelReason: rawOrder.cancelReason,
-    sourceName: (rawOrder.sourceName || "shopify").toLowerCase(),
+    sourceName: detectChannel(rawOrder),
     tags: rawOrder.tags || [],
     customer: rawOrder.customer,
     email: rawOrder.email,
@@ -431,7 +436,7 @@ export const loader = async ({ request }) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  3. USER INTERFACE GRAPHICAL RENDERING ENGINE                      */
+/*  3. USER INTERFACE COMPONENTS                                      */
 /* ------------------------------------------------------------------ */
 
 const CHANNEL_OPTIONS = [
