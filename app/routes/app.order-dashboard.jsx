@@ -40,7 +40,7 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FETCHING ENGINE (ALL ORDERS, NO LIMIT)       */
+/*  1. UNLIMITED GRAPHQL FETCHING ENGINE                              */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
@@ -156,7 +156,6 @@ function daysBetween(later, earlier) {
 
 function extractFocDate(productTags = [], productFocMetafield = null) {
   if (productFocMetafield) return productFocMetafield;
-  
   const tagList = Array.isArray(productTags) ? productTags : [];
   const focTag = tagList.find((t) => t.toLowerCase().startsWith("foc-"));
   if (focTag) {
@@ -510,7 +509,7 @@ function filterGroupsByQuery(groups, query) {
   });
 }
 
-function OrderSummaryRow({ order, indented }) {
+function OrderSummaryRow({ order }) {
   const itemCount = order.lineItems.reduce((sum, li) => sum + li.quantity, 0);
   const worstAging = order.lineItems.reduce((worst, li) => {
     if (li.agingStatus === "critical") return "critical";
@@ -519,38 +518,41 @@ function OrderSummaryRow({ order, indented }) {
   }, null);
 
   return (
-    <Box paddingInlineStart={indented ? "800" : "0"} paddingBlock="200">
-      <InlineStack align="space-between" blockAlign="center">
-        <InlineStack gap="300" blockAlign="center">
-          <Text as="span" fontWeight="semibold">{order.name}</Text>
-          <ChannelBadge sourceName={order.sourceName} />
-          <Text as="span" tone="subdued">Placed: {formatDate(order.createdAt)}</Text>
-          {order.isCancelled && (
-            <Badge tone="critical" icon={XIcon}>
-              Cancelled ({formatDate(order.cancelledAt)})
-            </Badge>
-          )}
-          <Text as="span" tone="subdued">{itemCount} Item(s)</Text>
+    <Box padding="300" background="bg-surface-secondary" borderRadius="200">
+      <BlockStack gap="200">
+        <InlineStack align="space-between" blockAlign="center">
+          <InlineStack gap="300" blockAlign="center">
+            <Text as="span" fontWeight="bold">{order.name}</Text>
+            <ChannelBadge sourceName={order.sourceName} />
+            <Text as="span" tone="subdued">Placed: {formatDate(order.createdAt)}</Text>
+            {order.isCancelled && (
+              <Badge tone="critical" icon={XIcon}>
+                Cancelled ({formatDate(order.cancelledAt)})
+              </Badge>
+            )}
+            <Text as="span" tone="subdued">{itemCount} Item(s)</Text>
+          </InlineStack>
+          <AgingBadge agingStatus={worstAging} />
         </InlineStack>
-        <AgingBadge agingStatus={worstAging} />
-      </InlineStack>
-      <Box paddingBlockStart="150">
-        <BlockStack gap="100">
+
+        <Divider />
+
+        <BlockStack gap="150">
           {order.lineItems.map((li) => (
             <InlineStack key={li.id} align="space-between">
-              <Text as="span" tone="subdued">
-                {li.unfulfilledQuantity} of {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
+              <Text as="span">
+                <Text as="span" fontWeight="bold">{li.unfulfilledQuantity}x</Text> of {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
               </Text>
               <InlineStack gap="200">
                 {li.focDate && <Badge tone="info">FOC: {li.focDate}</Badge>}
                 <Text as="span" tone="subdued">
-                  Release Status: {formatDate(li.releaseDate) === "—" ? "Immediate" : formatDate(li.releaseDate)}
+                  Release: {formatDate(li.releaseDate) === "—" ? "Immediate" : formatDate(li.releaseDate)}
                 </Text>
                 {order.isCancelled ? (
                   <Badge tone="critical">Voided</Badge>
                 ) : (
                   <>
-                    {!li.isReleased && <Badge tone="info">Future Pre-order</Badge>}
+                    {!li.isReleased && <Badge tone="info">Pre-order</Badge>}
                     {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
                     {li.unfulfilledQuantity > 0 && li.isReleased && <Badge tone="attention">Pending Pickup</Badge>}
                   </>
@@ -560,13 +562,13 @@ function OrderSummaryRow({ order, indented }) {
             </InlineStack>
           ))}
         </BlockStack>
-      </Box>
+      </BlockStack>
     </Box>
   );
 }
 
 function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) {
-  if (groups.length === 0) {
+  if (!groups || groups.length === 0) {
     return (
       <Box paddingBlock="800">
         <EmptyState
@@ -580,89 +582,59 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
   }
 
   return (
-    <BlockStack gap="0">
-      <IndexTable
-        resourceName={{ singular: "shipment block", plural: "shipment blocks" }}
-        itemCount={groups.length}
-        selectable={false}
-        headings={[
-          { title: "" },
-          { title: "Pack Destination" },
-          { title: "Pending Orders" },
-          { title: "Delivery Destination" },
-          { title: "Marketplace Track" },
-          { title: "Aging / Status" },
-        ]}
-      >
-        {groups.map((group, index) => {
-          const isExpanded = expandedGroups.has(group.key);
-          const primaryOrder = group.orders[0];
+    <BlockStack gap="300">
+      {groups.map((group) => {
+        const isExpanded = expandedGroups.has(group.key);
+        const primaryOrder = group.orders[0];
 
-          return (
-            <React.Fragment key={group.key}>
-              <IndexTable.Row id={group.key} key={group.key} position={index} tone={group.isMultiOrder ? "subdued" : undefined}>
-                <IndexTable.Cell>
+        return (
+          <Card key={group.key} padding="300">
+            <BlockStack gap="200">
+              <InlineStack align="space-between" blockAlign="center">
+                <InlineStack gap="300" blockAlign="center">
                   <Button
-                    variant="tertiary"
+                    variant="plain"
                     icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
                     onClick={() => onToggleGroup(group.key)}
                   />
-                </IndexTable.Cell>
-                <IndexTable.Cell>
-                  <BlockStack gap="0">
-                    <Text as="span" fontWeight="semibold">{group.customerName}</Text>
-                    <Text as="span" tone="subdued">{group.customerEmail}</Text>
+                  <BlockStack gap="050">
+                    <Text as="span" fontWeight="bold" variant="bodyMd">{group.customerName}</Text>
+                    <Text as="span" tone="subdued" variant="bodySm">{group.customerEmail}</Text>
                   </BlockStack>
-                </IndexTable.Cell>
-                <IndexTable.Cell>
+                </InlineStack>
+
+                <InlineStack gap="300" blockAlign="center">
                   {group.isMultiOrder ? (
-                    <Badge tone="attention">{`${group.orders.length} Combined Separate Orders`}</Badge>
+                    <Badge tone="attention">{`${group.orders.length} Orders Combined`}</Badge>
                   ) : (
-                    <Text as="span">{primaryOrder?.name}</Text>
+                    <Badge tone="info">{primaryOrder?.name}</Badge>
                   )}
-                </IndexTable.Cell>
-                <IndexTable.Cell>
-                  <Text as="span">{group.shippingAddress?.address1}{group.shippingAddress?.city ? `, ${group.shippingAddress.city}` : ""}</Text>
-                </IndexTable.Cell>
-                <IndexTable.Cell>
-                  <InlineStack gap="150">
-                    {Array.from(new Set(group.orders.map((o) => o.sourceName))).map((src) => (
-                      <ChannelBadge key={src} sourceName={src} />
-                    ))}
-                  </InlineStack>
-                </IndexTable.Cell>
-                <IndexTable.Cell>
+
+                  <Text as="span" tone="subdued" variant="bodySm">
+                    {group.shippingAddress?.city ? `${group.shippingAddress.city}, ${group.shippingAddress.country}` : "No Address"}
+                  </Text>
+
                   {bucketKey === "cancelled" ? (
                     <Badge tone="critical">Cancelled</Badge>
                   ) : (
                     <AgingBadge agingStatus={group.worstAging} />
                   )}
-                </IndexTable.Cell>
-              </IndexTable.Row>
+                </InlineStack>
+              </InlineStack>
 
               {isExpanded && (
-                <tr style={{ backgroundColor: "var(--p-color-bg-surface-secondary)" }}>
-                  <td colSpan={6} style={{ padding: "12px 24px" }}>
-                    <Box padding="400">
-                      <BlockStack gap="300">
-                        <Text as="h4" fontWeight="bold" tone="subdued">
-                          Consolidated Shipping Matrix Elements:
-                        </Text>
-                        {group.orders.map((order, i) => (
-                          <Box key={order.id}>
-                            <OrderSummaryRow order={order} indented={false} />
-                            {i < group.orders.length - 1 && <Divider />}
-                          </Box>
-                        ))}
-                      </BlockStack>
-                    </Box>
-                  </td>
-                </tr>
+                <Box paddingBlockStart="200">
+                  <BlockStack gap="200">
+                    {group.orders.map((order) => (
+                      <OrderSummaryRow key={order.id} order={order} />
+                    ))}
+                  </BlockStack>
+                </Box>
               )}
-            </React.Fragment>
-          );
-        })}
-      </IndexTable>
+            </BlockStack>
+          </Card>
+        );
+      })}
     </BlockStack>
   );
 }
@@ -723,36 +695,48 @@ function FocPullListView({ focGroups }) {
               <Badge tone="attention">{`${group.items.reduce((s, i) => s + i.quantity, 0)} Total Units to Order`}</Badge>
             </InlineStack>
 
-            <IndexTable
-              resourceName={{ singular: "FOC item", plural: "FOC items" }}
-              itemCount={group.items.length}
-              selectable={false}
-              headings={[
-                { title: "Physical Product Component (Quantity Needed)" },
-                { title: "Release Date" },
-                { title: "Order References" },
-              ]}
-            >
-              {group.items.map((item, idx) => (
-                <IndexTable.Row id={`${group.focDate}-${idx}`} key={`${group.focDate}-${idx}`} position={idx}>
-                  <IndexTable.Cell>
-                    <Text as="span" fontWeight="bold">{item.quantity}x </Text>
-                    <Text as="span" fontWeight="semibold">{item.title}</Text>
-                    {item.variantTitle && <Text as="span" tone="subdued"> — {item.variantTitle}</Text>}
-                  </IndexTable.Cell>
-                  <IndexTable.Cell>{formatDate(item.releaseDate)}</IndexTable.Cell>
-                  <IndexTable.Cell>
-                    <InlineStack gap="100">
-                      {item.orders.map((o, oIdx) => (
-                        <Tooltip key={oIdx} content={`${o.customer} (${o.sourceName})`}>
-                          <Badge tone="info">{o.orderName}</Badge>
-                        </Tooltip>
-                      ))}
-                    </InlineStack>
-                  </IndexTable.Cell>
-                </IndexTable.Row>
-              ))}
-            </IndexTable>
+            <div style={{ width: "100%", overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left" }}>
+                <thead>
+                  <tr style={{ borderBottom: "1px solid #E1E3E5", backgroundColor: "#F7F8F9" }}>
+                    <th style={{ padding: "10px 12px", width: "50%" }}>
+                      <Text as="span" fontWeight="bold" tone="subdued">Physical Product Component (Quantity Needed)</Text>
+                    </th>
+                    <th style={{ padding: "10px 12px", width: "15%" }}>
+                      <Text as="span" fontWeight="bold" tone="subdued">Release Date</Text>
+                    </th>
+                    <th style={{ padding: "10px 12px", width: "35%" }}>
+                      <Text as="span" fontWeight="bold" tone="subdued">Order References</Text>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {group.items.map((item, idx) => (
+                    <tr key={`${group.focDate}-${idx}`} style={{ borderBottom: "1px solid #E1E3E5" }}>
+                      <td style={{ padding: "12px 12px", verticalAlign: "top" }}>
+                        <Text as="span" fontWeight="bold">{item.quantity}x </Text>
+                        <Text as="span" fontWeight="semibold">{item.title}</Text>
+                        {item.variantTitle && (
+                          <Text as="span" tone="subdued"> — {item.variantTitle}</Text>
+                        )}
+                      </td>
+                      <td style={{ padding: "12px 12px", verticalAlign: "top", whiteSpace: "nowrap" }}>
+                        <Text as="span">{formatDate(item.releaseDate)}</Text>
+                      </td>
+                      <td style={{ padding: "12px 12px", verticalAlign: "top" }}>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center" }}>
+                          {item.orders.map((o, oIdx) => (
+                            <Tooltip key={oIdx} content={`${o.customer} (${o.sourceName})`}>
+                              <Badge tone="info">{o.orderName}</Badge>
+                            </Tooltip>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </BlockStack>
         </Card>
       ))}
@@ -880,12 +864,19 @@ export default function FulfillmentDashboard() {
                     </BlockStack>
                   )}
 
-                  <BucketIndexTable
-                    groups={filteredGroups}
-                    bucketKey={activeBucketKey}
-                    expandedGroups={expandedGroups}
-                    onToggleGroup={onToggleGroup}
-                  />
+                  <Box paddingBlockStart="200">
+                    <Text as="h3" variant="headingSm" tone="subdued">
+                      Orders in Queue ({filteredGroups.length} Customer Blocks)
+                    </Text>
+                    <Box paddingBlockStart="200">
+                      <BucketIndexTable
+                        groups={filteredGroups}
+                        bucketKey={activeBucketKey}
+                        expandedGroups={expandedGroups}
+                        onToggleGroup={onToggleGroup}
+                      />
+                    </Box>
+                  </Box>
                 </BlockStack>
               </Box>
             </Card>
