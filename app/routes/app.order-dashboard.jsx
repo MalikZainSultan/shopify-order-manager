@@ -30,6 +30,7 @@ import {
   XIcon,
   SearchIcon,
   CalendarIcon,
+  ClockIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
@@ -84,6 +85,7 @@ const ALL_ORDERS_QUERY = `#graphql
                 id
                 title
                 variantTitle
+                sku
                 quantity
                 unfulfilledQuantity
                 product {
@@ -154,6 +156,12 @@ function daysBetween(later, earlier) {
   return Math.floor((later.getTime() - earlier.getTime()) / MS_PER_DAY);
 }
 
+function addDays(date, days) {
+  const result = new Date(date);
+  result.setDate(result.getDate() + days);
+  return result;
+}
+
 function extractFocDate(productTags = [], productFocMetafield = null) {
   if (productFocMetafield) return productFocMetafield;
   const tagList = Array.isArray(productTags) ? productTags : [];
@@ -174,6 +182,18 @@ function detectChannel(order) {
   return "shopify";
 }
 
+function isCgcItem(item) {
+  const title = (item.title || "").toLowerCase();
+  const sku = (item.sku || "").toLowerCase();
+  const variantTitle = (item.variantTitle || "").toLowerCase();
+  return title.includes("cgc") || sku.includes("cgc") || variantTitle.includes("cgc");
+}
+
+function isCgcGradingReturned(orderTags = [], lineItemId) {
+  const tags = Array.isArray(orderTags) ? orderTags.map((t) => t.toLowerCase().trim()) : [];
+  return tags.includes("cgc-returned") || tags.includes(`cgc-returned-${lineItemId}`.toLowerCase());
+}
+
 function buildCustomerKey(order) {
   const c = order.customer;
   const email = order.email;
@@ -191,7 +211,6 @@ function processOrder(rawOrder, today) {
   if (allRawItems.length === 0) return null;
 
   const isCancelled = Boolean(rawOrder.cancelledAt);
-
   const isFullyFulfilled =
     rawOrder.displayFulfillmentStatus === "FULFILLED" ||
     allRawItems.every((li) => li.unfulfilledQuantity === 0);
@@ -202,26 +221,52 @@ function processOrder(rawOrder, today) {
     const isReleased = !releaseDate || releaseDate <= today;
 
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
+    const isCgc = isCgcItem(li);
+    const isReturned = isCgcGradingReturned(rawOrder.tags, li.id);
+
+    const isAtGrading = isCgc && isReleased && !isReturned;
+
+    let estimatedGradingReadyDate = null;
+    let daysPastGradingEstimate = null;
+
+    if (isCgc && releaseDate) {
+      estimatedGradingReadyDate = addDays(releaseDate, 90);
+      if (today > estimatedGradingReadyDate && !isReturned) {
+        daysPastGradingEstimate = daysBetween(today, estimatedGradingReadyDate);
+      }
+    }
 
     let daysPastRelease = null;
     let agingStatus = null;
 
     if (isReleased && releaseDate && li.unfulfilledQuantity > 0 && !isCancelled) {
-      daysPastRelease = daysBetween(today, releaseDate);
-      if (daysPastRelease >= 14) agingStatus = "critical";
-      else if (daysPastRelease >= 7) agingStatus = "warning";
+      if (isAtGrading) {
+        if (daysPastGradingEstimate && daysPastGradingEstimate > 0) {
+          agingStatus = "critical"; 
+        }
+      } else {
+        daysPastRelease = daysBetween(today, releaseDate);
+        if (daysPastRelease >= 14) agingStatus = "critical";
+        else if (daysPastRelease >= 7) agingStatus = "warning";
+      }
     }
 
     return {
       id: li.id,
       title: li.title,
       variantTitle: li.variantTitle,
+      sku: li.sku || "",
       quantity: li.quantity,
       unfulfilledQuantity: li.unfulfilledQuantity,
       productId: li.product?.id || null,
       releaseDate: releaseDateRaw,
       focDate: focDateRaw,
       isReleased,
+      isCgc,
+      isAtGrading,
+      isGradingReturned: isReturned,
+      estimatedGradingReadyDate: estimatedGradingReadyDate ? estimatedGradingReadyDate.toISOString() : null,
+      daysPastGradingEstimate,
       daysPastRelease,
       agingStatus,
     };
@@ -235,13 +280,20 @@ function processOrder(rawOrder, today) {
   } else if (isFullyFulfilled) {
     bucket = "completed";
   } else {
-    const activeUnfulfilledItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
-    const allReleased = activeUnfulfilledItems.every((li) => li.isReleased);
-    const noneReleased = activeUnfulfilledItems.every((li) => !li.isReleased);
+    const activeItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
+    const allAtGrading = activeItems.every((li) => li.isAtGrading);
+    const allPreOrder = activeItems.every((li) => !li.isReleased);
+    const allReadyToShip = activeItems.every((li) => li.isReleased && !li.isAtGrading);
 
-    if (allReleased) bucket = "readyToShip";
-    else if (noneReleased) bucket = "waitingOnRelease";
-    else bucket = "partiallyReady";
+    if (allReadyToShip) {
+      bucket = "readyToShip";
+    } else if (allAtGrading) {
+      bucket = "atGrading";
+    } else if (allPreOrder) {
+      bucket = "waitingOnRelease";
+    } else {
+      bucket = "partiallyReady";
+    }
   }
 
   return {
@@ -356,6 +408,7 @@ function processOrders(rawOrders) {
   const buckets = {
     allUnfulfilled: [],
     readyToShip: [],
+    atGrading: [],
     partiallyReady: [],
     waitingOnRelease: [],
     completed: [],
@@ -374,11 +427,13 @@ function processOrders(rawOrders) {
       buckets.allUnfulfilled.push(processed);
     }
 
-    buckets[processed.bucket].push(processed);
+    if (buckets[processed.bucket]) {
+      buckets[processed.bucket].push(processed);
+    }
 
     if (processed.bucket === "partiallyReady") {
       processed.lineItems
-        .filter((li) => li.isReleased && li.unfulfilledQuantity > 0)
+        .filter((li) => li.isReleased && !li.isAtGrading && li.unfulfilledQuantity > 0)
         .forEach((li) => {
           pullListItems.push({
             orderId: processed.id,
@@ -401,6 +456,7 @@ function processOrders(rawOrders) {
     groups: {
       allUnfulfilled: groupByCustomer(buckets.allUnfulfilled),
       readyToShip: groupByCustomer(buckets.readyToShip),
+      atGrading: groupByCustomer(buckets.atGrading),
       partiallyReady: groupByCustomer(buckets.partiallyReady),
       waitingOnRelease: groupByCustomer(buckets.waitingOnRelease),
       completed: groupByCustomer(buckets.completed),
@@ -409,6 +465,7 @@ function processOrders(rawOrders) {
     counts: {
       allUnfulfilled: buckets.allUnfulfilled.length,
       readyToShip: buckets.readyToShip.length,
+      atGrading: buckets.atGrading.length,
       partiallyReady: buckets.partiallyReady.length,
       waitingOnRelease: buckets.waitingOnRelease.length,
       completed: buckets.completed.length,
@@ -465,7 +522,7 @@ function ChannelBadge({ sourceName }) {
 
 function AgingBadge({ agingStatus }) {
   if (agingStatus === "critical") {
-    return <Badge tone="critical" icon={AlertTriangleIcon}>2+ Wks Late Escalation</Badge>;
+    return <Badge tone="critical" icon={AlertTriangleIcon}>Overdue / Late Flag</Badge>;
   }
   if (agingStatus === "warning") {
     return <Badge tone="warning" icon={AlertTriangleIcon}>1+ Wk Late Aging Flag</Badge>;
@@ -477,6 +534,7 @@ function BucketBadge({ bucketKey }) {
   const map = {
     allUnfulfilled: { tone: "attention", label: "All Unfulfilled Queue" },
     readyToShip: { tone: "success", label: "Ready to Ship" },
+    atGrading: { tone: "warning", label: "At CGC Grading" },
     partiallyReady: { tone: "attention", label: "Partially Ready" },
     waitingOnRelease: { tone: "info", label: "Waiting on Release" },
     completed: { tone: "complete", label: "Shipped & Completed" },
@@ -544,17 +602,26 @@ function OrderSummaryRow({ order }) {
                 <Text as="span" fontWeight="bold">{li.unfulfilledQuantity}x</Text> of {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
               </Text>
               <InlineStack gap="200">
+                {li.isCgc && <Badge tone="warning">CGC Slab</Badge>}
                 {li.focDate && <Badge tone="info">FOC: {li.focDate}</Badge>}
                 <Text as="span" tone="subdued">
                   Release: {formatDate(li.releaseDate) === "—" ? "Immediate" : formatDate(li.releaseDate)}
                 </Text>
+                {li.isAtGrading && li.estimatedGradingReadyDate && (
+                  <Badge tone={li.daysPastGradingEstimate ? "critical" : "info"} icon={ClockIcon}>
+                    Est. Return: {formatDate(li.estimatedGradingReadyDate)}
+                  </Badge>
+                )}
                 {order.isCancelled ? (
                   <Badge tone="critical">Voided</Badge>
                 ) : (
                   <>
                     {!li.isReleased && <Badge tone="info">Pre-order</Badge>}
+                    {li.isAtGrading && <Badge tone="warning">At Grading (60-90d)</Badge>}
                     {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
-                    {li.unfulfilledQuantity > 0 && li.isReleased && <Badge tone="attention">Pending Pickup</Badge>}
+                    {li.unfulfilledQuantity > 0 && li.isReleased && !li.isAtGrading && (
+                      <Badge tone="attention">Pending Pickup</Badge>
+                    )}
                   </>
                 )}
                 <AgingBadge agingStatus={li.agingStatus} />
@@ -764,6 +831,7 @@ export default function FulfillmentDashboard() {
   const tabs = [
     { id: "all-unfulfilled", content: "Unfulfilled Orders", badgeCount: counts.allUnfulfilled, bucketKey: "allUnfulfilled" },
     { id: "ready-to-ship", content: "Ready to Ship", badgeCount: counts.readyToShip, bucketKey: "readyToShip" },
+    { id: "at-grading", content: "At Grading (CGC)", badgeCount: counts.atGrading, bucketKey: "atGrading" },
     { id: "partially-ready", content: "Partially Ready", badgeCount: counts.partiallyReady, bucketKey: "partiallyReady" },
     { id: "waiting-on-release", content: "Waiting on Release", badgeCount: counts.waitingOnRelease, bucketKey: "waitingOnRelease" },
     { id: "completed-shipped", content: "Completed / Shipped", badgeCount: counts.completed, bucketKey: "completed" },
@@ -844,7 +912,16 @@ export default function FulfillmentDashboard() {
                     </Banner>
                   )}
 
-                  {selectedTab === 2 && !queryValue.trim() && (
+                  {activeBucketKey === "atGrading" && !queryValue.trim() && (
+                    <Banner tone="warning" icon={ClockIcon}>
+                      <Text as="p" fontWeight="semibold">CGC Grading Processing Queue</Text>
+                      <Text as="p">
+                        Items currently undergoing 60-90 day slab grading. Add tag <code>cgc-returned</code> to order to unlock to Ready to Ship.
+                      </Text>
+                    </Banner>
+                  )}
+
+                  {selectedTab === 3 && !queryValue.trim() && (
                     <Banner tone="warning" icon={PackageIcon}>
                       <Text as="p" fontWeight="semibold">Warehouse Extract / Harvest Pull List</Text>
                       <Text as="p">Extract these line items from storage racks immediately. They are physically released but bound inside composite pre-order allocations.</Text>
@@ -854,7 +931,7 @@ export default function FulfillmentDashboard() {
                     </Banner>
                   )}
 
-                  {selectedTab === 3 && !queryValue.trim() && (
+                  {selectedTab === 4 && !queryValue.trim() && (
                     <BlockStack gap="300">
                       <Banner tone="info" icon={CalendarIcon}>
                         <Text as="p" fontWeight="semibold">FOC Weekly Ordering Pull List</Text>
@@ -896,6 +973,10 @@ export default function FulfillmentDashboard() {
                 <InlineStack align="space-between">
                   <BucketBadge bucketKey="readyToShip" />
                   <Text as="span">{counts.readyToShip} Orders Pending</Text>
+                </InlineStack>
+                <InlineStack align="space-between">
+                  <BucketBadge bucketKey="atGrading" />
+                  <Text as="span">{counts.atGrading} Slabs at CGC</Text>
                 </InlineStack>
                 <InlineStack align="space-between">
                   <BucketBadge bucketKey="partiallyReady" />
