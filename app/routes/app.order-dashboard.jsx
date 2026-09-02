@@ -66,6 +66,12 @@ const ALL_ORDERS_QUERY = `#graphql
           displayFulfillmentStatus
           displayFinancialStatus
           tags
+          sourceName
+          note
+          customAttributes {
+            key
+            value
+          }
           customer {
             firstName
             lastName
@@ -175,10 +181,32 @@ function extractFocDate(productTags = [], productFocMetafield = null) {
   return null;
 }
 
+// Robust eBay & Marketplace Channel Detection
 function detectChannel(order) {
   const tagList = Array.isArray(order.tags) ? order.tags.map((t) => t.toLowerCase()) : [];
-  if (tagList.some((t) => t.includes("ebay"))) return "ebay";
-  if (tagList.some((t) => t.includes("whatnot"))) return "whatnot";
+  const rawSource = (order.sourceName || "").toLowerCase();
+  const note = (order.note || "").toLowerCase();
+  const customAttrs = Array.isArray(order.customAttributes)
+    ? order.customAttributes.map((attr) => `${attr.key || ""} ${attr.value || ""}`.toLowerCase()).join(" ")
+    : "";
+
+  const isEbay =
+    tagList.some((t) => t.includes("ebay") || t.includes("cedcommerce") || t.includes("marketplace")) ||
+    rawSource.includes("ebay") ||
+    note.includes("ebay") ||
+    customAttrs.includes("ebay") ||
+    (order.name && /^(\d{2}-\d{5}-\d{5}|ebay)/i.test(order.name.trim()));
+
+  if (isEbay) return "ebay";
+
+  const isWhatnot =
+    tagList.some((t) => t.includes("whatnot")) ||
+    rawSource.includes("whatnot") ||
+    note.includes("whatnot") ||
+    customAttrs.includes("whatnot");
+
+  if (isWhatnot) return "whatnot";
+
   return "shopify";
 }
 
@@ -242,7 +270,7 @@ function processOrder(rawOrder, today) {
     if (isReleased && releaseDate && li.unfulfilledQuantity > 0 && !isCancelled) {
       if (isAtGrading) {
         if (daysPastGradingEstimate && daysPastGradingEstimate > 0) {
-          agingStatus = "critical"; 
+          agingStatus = "critical";
         }
       } else {
         daysPastRelease = daysBetween(today, releaseDate);
@@ -329,6 +357,9 @@ function groupByCustomer(orders) {
         `${first.customer?.firstName || ""} ${first.customer?.lastName || ""}`.trim() ||
         first.shippingAddress?.name ||
         "Unknown Buyer";
+
+      const hasEbay = groupOrders.some((o) => o.sourceName === "ebay");
+
       return {
         key: first.customerKey,
         customerName,
@@ -336,6 +367,7 @@ function groupByCustomer(orders) {
         shippingAddress: first.shippingAddress,
         orders: groupOrders,
         isMultiOrder: groupOrders.length > 1,
+        hasEbay,
         worstAging: groupOrders.reduce((worst, o) => {
           const orderWorst = o.lineItems.reduce((w, li) => {
             if (li.agingStatus === "critical") return "critical";
@@ -511,9 +543,29 @@ function formatDate(dateString) {
 }
 
 function ChannelBadge({ sourceName }) {
+  if (sourceName === "ebay") {
+    return (
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          backgroundColor: "#0064D2",
+          color: "#ffffff",
+          fontWeight: 700,
+          fontSize: "12px",
+          padding: "2px 8px",
+          borderRadius: "6px",
+          letterSpacing: "0.5px",
+          boxShadow: "0 1px 3px rgba(0, 100, 210, 0.4)",
+        }}
+      >
+        ★ EBAY ORDER
+      </span>
+    );
+  }
+
   const map = {
     shopify: { tone: "success", label: "Shopify" },
-    ebay: { tone: "info", label: "eBay" },
     whatnot: { tone: "attention", label: "Whatnot" },
   };
   const entry = map[sourceName] || { tone: undefined, label: sourceName };
@@ -562,12 +614,13 @@ function filterGroupsByQuery(groups, query) {
     return (
       group.customerName.toLowerCase().includes(q) ||
       group.customerEmail.toLowerCase().includes(q) ||
-      group.orders.some((o) => o.name.toLowerCase().includes(q))
+      group.orders.some((o) => o.name.toLowerCase().includes(q) || (o.tags && o.tags.some(t => t.toLowerCase().includes(q))))
     );
   });
 }
 
 function OrderSummaryRow({ order }) {
+  const isEbay = order.sourceName === "ebay";
   const itemCount = order.lineItems.reduce((sum, li) => sum + li.quantity, 0);
   const worstAging = order.lineItems.reduce((worst, li) => {
     if (li.agingStatus === "critical") return "critical";
@@ -576,61 +629,70 @@ function OrderSummaryRow({ order }) {
   }, null);
 
   return (
-    <Box padding="300" background="bg-surface-secondary" borderRadius="200">
-      <BlockStack gap="200">
-        <InlineStack align="space-between" blockAlign="center">
-          <InlineStack gap="300" blockAlign="center">
-            <Text as="span" fontWeight="bold">{order.name}</Text>
-            <ChannelBadge sourceName={order.sourceName} />
-            <Text as="span" tone="subdued">Placed: {formatDate(order.createdAt)}</Text>
-            {order.isCancelled && (
-              <Badge tone="critical" icon={XIcon}>
-                Cancelled ({formatDate(order.cancelledAt)})
-              </Badge>
-            )}
-            <Text as="span" tone="subdued">{itemCount} Item(s)</Text>
-          </InlineStack>
-          <AgingBadge agingStatus={worstAging} />
-        </InlineStack>
-
-        <Divider />
-
-        <BlockStack gap="150">
-          {order.lineItems.map((li) => (
-            <InlineStack key={li.id} align="space-between">
-              <Text as="span">
-                <Text as="span" fontWeight="bold">{li.unfulfilledQuantity}x</Text> of {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
-              </Text>
-              <InlineStack gap="200">
-                {li.isCgc && <Badge tone="warning">CGC Slab</Badge>}
-                {li.focDate && <Badge tone="info">FOC: {li.focDate}</Badge>}
-                <Text as="span" tone="subdued">
-                  Release: {formatDate(li.releaseDate) === "—" ? "Immediate" : formatDate(li.releaseDate)}
-                </Text>
-                {li.isAtGrading && li.estimatedGradingReadyDate && (
-                  <Badge tone={li.daysPastGradingEstimate ? "critical" : "info"} icon={ClockIcon}>
-                    Est. Return: {formatDate(li.estimatedGradingReadyDate)}
-                  </Badge>
-                )}
-                {order.isCancelled ? (
-                  <Badge tone="critical">Voided</Badge>
-                ) : (
-                  <>
-                    {!li.isReleased && <Badge tone="info">Pre-order</Badge>}
-                    {li.isAtGrading && <Badge tone="warning">At Grading (60-90d)</Badge>}
-                    {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
-                    {li.unfulfilledQuantity > 0 && li.isReleased && !li.isAtGrading && (
-                      <Badge tone="attention">Pending Pickup</Badge>
-                    )}
-                  </>
-                )}
-                <AgingBadge agingStatus={li.agingStatus} />
-              </InlineStack>
+    <div
+      style={{
+        borderLeft: isEbay ? "4px solid #0064D2" : "4px solid transparent",
+        backgroundColor: isEbay ? "#F0F6FF" : "transparent",
+        borderRadius: "6px",
+        transition: "all 0.2s ease",
+      }}
+    >
+      <Box padding="300" background="bg-surface-secondary" borderRadius="200">
+        <BlockStack gap="200">
+          <InlineStack align="space-between" blockAlign="center">
+            <InlineStack gap="300" blockAlign="center">
+              <Text as="span" fontWeight="bold">{order.name}</Text>
+              <ChannelBadge sourceName={order.sourceName} />
+              <Text as="span" tone="subdued">Placed: {formatDate(order.createdAt)}</Text>
+              {order.isCancelled && (
+                <Badge tone="critical" icon={XIcon}>
+                  Cancelled ({formatDate(order.cancelledAt)})
+                </Badge>
+              )}
+              <Text as="span" tone="subdued">{itemCount} Item(s)</Text>
             </InlineStack>
-          ))}
+            <AgingBadge agingStatus={worstAging} />
+          </InlineStack>
+
+          <Divider />
+
+          <BlockStack gap="150">
+            {order.lineItems.map((li) => (
+              <InlineStack key={li.id} align="space-between">
+                <Text as="span">
+                  <Text as="span" fontWeight="bold">{li.unfulfilledQuantity}x</Text> of {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
+                </Text>
+                <InlineStack gap="200">
+                  {li.isCgc && <Badge tone="warning">CGC Slab</Badge>}
+                  {li.focDate && <Badge tone="info">FOC: {li.focDate}</Badge>}
+                  <Text as="span" tone="subdued">
+                    Release: {formatDate(li.releaseDate) === "—" ? "Immediate" : formatDate(li.releaseDate)}
+                  </Text>
+                  {li.isAtGrading && li.estimatedGradingReadyDate && (
+                    <Badge tone={li.daysPastGradingEstimate ? "critical" : "info"} icon={ClockIcon}>
+                      Est. Return: {formatDate(li.estimatedGradingReadyDate)}
+                    </Badge>
+                  )}
+                  {order.isCancelled ? (
+                    <Badge tone="critical">Voided</Badge>
+                  ) : (
+                    <>
+                      {!li.isReleased && <Badge tone="info">Pre-order</Badge>}
+                      {li.isAtGrading && <Badge tone="warning">At Grading (60-90d)</Badge>}
+                      {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
+                      {li.unfulfilledQuantity > 0 && li.isReleased && !li.isAtGrading && (
+                        <Badge tone="attention">Pending Pickup</Badge>
+                      )}
+                    </>
+                  )}
+                  <AgingBadge agingStatus={li.agingStatus} />
+                </InlineStack>
+              </InlineStack>
+            ))}
+          </BlockStack>
         </BlockStack>
-      </BlockStack>
-    </Box>
+      </Box>
+    </div>
   );
 }
 
@@ -655,51 +717,76 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
         const primaryOrder = group.orders[0];
 
         return (
-          <Card key={group.key} padding="300">
-            <BlockStack gap="200">
-              <InlineStack align="space-between" blockAlign="center">
-                <InlineStack gap="300" blockAlign="center">
-                  <Button
-                    variant="plain"
-                    icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
-                    onClick={() => onToggleGroup(group.key)}
-                  />
-                  <BlockStack gap="050">
-                    <Text as="span" fontWeight="bold" variant="bodyMd">{group.customerName}</Text>
-                    <Text as="span" tone="subdued" variant="bodySm">{group.customerEmail}</Text>
-                  </BlockStack>
+          <div
+            key={group.key}
+            style={{
+              borderRadius: "8px",
+              border: group.hasEbay ? "2px solid #0064D2" : "1px solid #E1E3E5",
+              boxShadow: group.hasEbay ? "0 0 10px rgba(0, 100, 210, 0.15)" : "none",
+            }}
+          >
+            <Card padding="300">
+              <BlockStack gap="200">
+                <InlineStack align="space-between" blockAlign="center">
+                  <InlineStack gap="300" blockAlign="center">
+                    <Button
+                      variant="plain"
+                      icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
+                      onClick={() => onToggleGroup(group.key)}
+                    />
+                    <BlockStack gap="050">
+                      <InlineStack gap="200" blockAlign="center">
+                        <Text as="span" fontWeight="bold" variant="bodyMd">{group.customerName}</Text>
+                        {group.hasEbay && (
+                          <span
+                            style={{
+                              backgroundColor: "#0064D2",
+                              color: "#fff",
+                              fontWeight: "bold",
+                              fontSize: "11px",
+                              padding: "1px 6px",
+                              borderRadius: "4px",
+                            }}
+                          >
+                            EBAY
+                          </span>
+                        )}
+                      </InlineStack>
+                      <Text as="span" tone="subdued" variant="bodySm">{group.customerEmail}</Text>
+                    </BlockStack>
+                  </InlineStack>
+
+                  <InlineStack gap="300" blockAlign="center">
+                    {group.isMultiOrder ? (
+                      <Badge tone="attention">{`${group.orders.length} Orders Combined`}</Badge>
+                    ) : (
+                      <Badge tone="info">{primaryOrder?.name}</Badge>
+                    )}
+
+                    <Text as="span" tone="subdued" variant="bodySm">
+                      {group.shippingAddress?.city ? `${group.shippingAddress.city}, ${group.shippingAddress.country}` : "No Address"}
+                    </Text>
+
+                    {bucketKey === "cancelled" ? (
+                      <Badge tone="critical">Cancelled</Badge>
+                    ) : (
+                      <AgingBadge agingStatus={group.worstAging} />
+                    )}
+                  </InlineStack>
                 </InlineStack>
 
-                <InlineStack gap="300" blockAlign="center">
-                  {group.isMultiOrder ? (
-                    <Badge tone="attention">{`${group.orders.length} Orders Combined`}</Badge>
-                  ) : (
-                    <Badge tone="info">{primaryOrder?.name}</Badge>
-                  )}
-
-                  <Text as="span" tone="subdued" variant="bodySm">
-                    {group.shippingAddress?.city ? `${group.shippingAddress.city}, ${group.shippingAddress.country}` : "No Address"}
-                  </Text>
-
-                  {bucketKey === "cancelled" ? (
-                    <Badge tone="critical">Cancelled</Badge>
-                  ) : (
-                    <AgingBadge agingStatus={group.worstAging} />
-                  )}
-                </InlineStack>
-              </InlineStack>
-
-              {isExpanded && (
-                <Box paddingBlockStart="200">
-                  <BlockStack gap="200">
-                    {group.orders.map((order) => (
-                      <OrderSummaryRow key={order.id} order={order} />
-                    ))}
-                  </BlockStack>
-                </Box>
-              )}
-            </BlockStack>
-          </Card>
+                {isExpanded && (
+                  <Box paddingBlockStart="200">
+                    <BlockStack gap="200">
+                      {group.orders.map((order) => (
+                        <OrderSummaryRow key={order.id} order={order} />
+                      ))}
+                    </BlockStack>
+                  </Box>
+                )}
+              </BlockStack>
+            </Card>
+          </div>
         );
       })}
     </BlockStack>
@@ -794,7 +881,7 @@ function FocPullListView({ focGroups }) {
                         <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center" }}>
                           {item.orders.map((o, oIdx) => (
                             <Tooltip key={oIdx} content={`${o.customer} (${o.sourceName})`}>
-                              <Badge tone="info">{o.orderName}</Badge>
+                              <Badge tone={o.sourceName === "ebay" ? "info" : "base"}>{o.orderName}</Badge>
                             </Tooltip>
                           ))}
                         </div>
@@ -883,7 +970,7 @@ export default function FulfillmentDashboard() {
                 <BlockStack gap="400">
                   <Filters
                     queryValue={queryValue}
-                    queryPlaceholder="Global Search: Type Order # or Customer Name across ALL tabs..."
+                    queryPlaceholder="Global Search: Type Order #, SKU, or Customer Name across ALL tabs..."
                     onQueryChange={setQueryValue}
                     onQueryClear={() => setQueryValue("")}
                     onClearAll={() => { setQueryValue(""); setChannelFilter([]); }}
