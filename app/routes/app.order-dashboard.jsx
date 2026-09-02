@@ -44,6 +44,7 @@ const jsonResponse = (data) => {
 /*  1. UNLIMITED GRAPHQL FETCHING ENGINE                              */
 /* ------------------------------------------------------------------ */
 
+// query: "status:any" lagane se Shopify ke ALL orders fetch hotay hain bina kisi drop ke
 const ALL_ORDERS_QUERY = `#graphql
   query FetchReleaseQueue($cursor: String) {
     orders(
@@ -51,6 +52,7 @@ const ALL_ORDERS_QUERY = `#graphql
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
+      query: "status:any"
     ) {
       pageInfo {
         hasNextPage
@@ -177,7 +179,10 @@ function extractFocDate(productTags = [], productFocMetafield = null) {
 
 function detectChannel(order) {
   const tagList = Array.isArray(order.tags) ? order.tags.map((t) => t.toLowerCase()) : [];
-  if (tagList.some((t) => t.includes("ebay"))) return "ebay";
+  // Agar tags me ebay ho YA order name eBay format (10-xxxxx) me ho
+  if (tagList.some((t) => t.includes("ebay") || t.includes("cedcommerce")) || (order.name && order.name.toLowerCase().includes("ebay")) || (order.name && /^\d{2}-\d{5}-\d{5}/.test(order.name.trim()))) {
+    return "ebay";
+  }
   if (tagList.some((t) => t.includes("whatnot"))) return "whatnot";
   return "shopify";
 }
@@ -510,10 +515,27 @@ function formatDate(dateString) {
   });
 }
 
+// YAHAN EBAY ORDER PAR EBAY LIKHA HUA SHOW HOGA
 function ChannelBadge({ sourceName }) {
+  if (sourceName === "ebay") {
+    return (
+      <span
+        style={{
+          backgroundColor: "#0064D2",
+          color: "#ffffff",
+          fontWeight: 700,
+          fontSize: "12px",
+          padding: "3px 8px",
+          borderRadius: "6px",
+          display: "inline-block",
+        }}
+      >
+        EBAY
+      </span>
+    );
+  }
   const map = {
     shopify: { tone: "success", label: "Shopify" },
-    ebay: { tone: "info", label: "eBay" },
     whatnot: { tone: "attention", label: "Whatnot" },
   };
   const entry = map[sourceName] || { tone: undefined, label: sourceName };
