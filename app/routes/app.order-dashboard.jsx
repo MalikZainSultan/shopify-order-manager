@@ -44,7 +44,6 @@ const jsonResponse = (data) => {
 /*  1. UNLIMITED GRAPHQL FETCHING ENGINE                              */
 /* ------------------------------------------------------------------ */
 
-// query: "status:any" lagane se Shopify ke ALL orders fetch hotay hain bina kisi drop ke
 const ALL_ORDERS_QUERY = `#graphql
   query FetchReleaseQueue($cursor: String) {
     orders(
@@ -178,11 +177,16 @@ function extractFocDate(productTags = [], productFocMetafield = null) {
 }
 
 function detectChannel(order) {
-  const tagList = Array.isArray(order.tags) ? order.tags.map((t) => t.toLowerCase()) : [];
-  // Agar tags me ebay ho YA order name eBay format (10-xxxxx) me ho
-  if (tagList.some((t) => t.includes("ebay") || t.includes("cedcommerce")) || (order.name && order.name.toLowerCase().includes("ebay")) || (order.name && /^\d{2}-\d{5}-\d{5}/.test(order.name.trim()))) {
+  const tagList = Array.isArray(order.tags) ? order.tags.map((t) => (t || "").toLowerCase()) : [];
+  const orderName = (order.name || "").toLowerCase();
+
+  const hasEbayTag = tagList.some((t) => t.includes("ebay") || t.includes("cedcommerce"));
+  const isEbayOrderNumber = orderName.includes("ebay") || /^\d{2}-\d{5}-\d{5}/.test(order.name ? order.name.trim() : "");
+
+  if (hasEbayTag || isEbayOrderNumber) {
     return "ebay";
   }
+
   if (tagList.some((t) => t.includes("whatnot"))) return "whatnot";
   return "shopify";
 }
@@ -247,7 +251,7 @@ function processOrder(rawOrder, today) {
     if (isReleased && releaseDate && li.unfulfilledQuantity > 0 && !isCancelled) {
       if (isAtGrading) {
         if (daysPastGradingEstimate && daysPastGradingEstimate > 0) {
-          agingStatus = "critical"; 
+          agingStatus = "critical";
         }
       } else {
         daysPastRelease = daysBetween(today, releaseDate);
@@ -515,7 +519,6 @@ function formatDate(dateString) {
   });
 }
 
-// YAHAN EBAY ORDER PAR EBAY LIKHA HUA SHOW HOGA
 function ChannelBadge({ sourceName }) {
   if (sourceName === "ebay") {
     return (
@@ -523,10 +526,10 @@ function ChannelBadge({ sourceName }) {
         style={{
           backgroundColor: "#0064D2",
           color: "#ffffff",
-          fontWeight: 700,
+          fontWeight: "800",
           fontSize: "12px",
           padding: "3px 8px",
-          borderRadius: "6px",
+          borderRadius: "4px",
           display: "inline-block",
         }}
       >
@@ -675,53 +678,81 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
       {groups.map((group) => {
         const isExpanded = expandedGroups.has(group.key);
         const primaryOrder = group.orders[0];
+        const isEbayCustomer = group.orders.some((o) => o.sourceName === "ebay");
 
         return (
-          <Card key={group.key} padding="300">
-            <BlockStack gap="200">
-              <InlineStack align="space-between" blockAlign="center">
-                <InlineStack gap="300" blockAlign="center">
-                  <Button
-                    variant="plain"
-                    icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
-                    onClick={() => onToggleGroup(group.key)}
-                  />
-                  <BlockStack gap="050">
-                    <Text as="span" fontWeight="bold" variant="bodyMd">{group.customerName}</Text>
-                    <Text as="span" tone="subdued" variant="bodySm">{group.customerEmail}</Text>
-                  </BlockStack>
+          <div
+            key={group.key}
+            style={{
+              borderRadius: "8px",
+              border: isEbayCustomer ? "2px solid #0064D2" : "1px solid #E1E3E5",
+              boxShadow: isEbayCustomer ? "0 1px 6px rgba(0, 100, 210, 0.15)" : "none",
+            }}
+          >
+            <Card padding="300">
+              <BlockStack gap="200">
+                <InlineStack align="space-between" blockAlign="center">
+                  <InlineStack gap="300" blockAlign="center">
+                    <Button
+                      variant="plain"
+                      icon={isExpanded ? ChevronUpIcon : ChevronDownIcon}
+                      onClick={() => onToggleGroup(group.key)}
+                    />
+                    <BlockStack gap="050">
+                      <InlineStack gap="200" blockAlign="center">
+                        <Text as="span" fontWeight="bold" variant="bodyMd">{group.customerName}</Text>
+                        {isEbayCustomer && (
+                          <span
+                            style={{
+                              backgroundColor: "#0064D2",
+                              color: "#ffffff",
+                              fontWeight: "800",
+                              fontSize: "11px",
+                              padding: "2px 8px",
+                              borderRadius: "4px",
+                              letterSpacing: "0.5px",
+                              display: "inline-block",
+                            }}
+                          >
+                            EBAY
+                          </span>
+                        )}
+                      </InlineStack>
+                      <Text as="span" tone="subdued" variant="bodySm">{group.customerEmail}</Text>
+                    </BlockStack>
+                  </InlineStack>
+
+                  <InlineStack gap="300" blockAlign="center">
+                    {group.isMultiOrder ? (
+                      <Badge tone="attention">{`${group.orders.length} Orders Combined`}</Badge>
+                    ) : (
+                      <Badge tone="info">{primaryOrder?.name}</Badge>
+                    )}
+
+                    <Text as="span" tone="subdued" variant="bodySm">
+                      {group.shippingAddress?.city ? `${group.shippingAddress.city}, ${group.shippingAddress.country}` : "No Address"}
+                    </Text>
+
+                    {bucketKey === "cancelled" ? (
+                      <Badge tone="critical">Cancelled</Badge>
+                    ) : (
+                      <AgingBadge agingStatus={group.worstAging} />
+                    )}
+                  </InlineStack>
                 </InlineStack>
 
-                <InlineStack gap="300" blockAlign="center">
-                  {group.isMultiOrder ? (
-                    <Badge tone="attention">{`${group.orders.length} Orders Combined`}</Badge>
-                  ) : (
-                    <Badge tone="info">{primaryOrder?.name}</Badge>
-                  )}
-
-                  <Text as="span" tone="subdued" variant="bodySm">
-                    {group.shippingAddress?.city ? `${group.shippingAddress.city}, ${group.shippingAddress.country}` : "No Address"}
-                  </Text>
-
-                  {bucketKey === "cancelled" ? (
-                    <Badge tone="critical">Cancelled</Badge>
-                  ) : (
-                    <AgingBadge agingStatus={group.worstAging} />
-                  )}
-                </InlineStack>
-              </InlineStack>
-
-              {isExpanded && (
-                <Box paddingBlockStart="200">
-                  <BlockStack gap="200">
-                    {group.orders.map((order) => (
-                      <OrderSummaryRow key={order.id} order={order} />
-                    ))}
-                  </BlockStack>
-                </Box>
-              )}
-            </BlockStack>
-          </Card>
+                {isExpanded && (
+                  <Box paddingBlockStart="200">
+                    <BlockStack gap="200">
+                      {group.orders.map((order) => (
+                        <OrderSummaryRow key={order.id} order={order} />
+                      ))}
+                    </BlockStack>
+                  </Box>
+                )}
+              </BlockStack>
+            </Card>
+          </div>
         );
       })}
     </BlockStack>
@@ -816,7 +847,7 @@ function FocPullListView({ focGroups }) {
                         <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center" }}>
                           {item.orders.map((o, oIdx) => (
                             <Tooltip key={oIdx} content={`${o.customer} (${o.sourceName})`}>
-                              <Badge tone="info">{o.orderName}</Badge>
+                              <Badge tone={o.sourceName === "ebay" ? "info" : "base"}>{o.orderName}</Badge>
                             </Tooltip>
                           ))}
                         </div>
