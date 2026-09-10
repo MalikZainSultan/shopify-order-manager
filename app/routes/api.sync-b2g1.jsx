@@ -1,4 +1,5 @@
-import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
+import shopify from "../shopify.server";
 
 const jsonResponse = (data, status = 200) => {
   return new Response(JSON.stringify(data), {
@@ -9,9 +10,39 @@ const jsonResponse = (data, status = 200) => {
 
 export const loader = async ({ request }) => {
   try {
-    const { admin } = await authenticate.admin(request);
+    // 1. Session dhoondein (Chahe Shopify Admin se ho ya external Cron Job se)
+    let adminClient = null;
 
-    // Aaj se 3 months (90 din) pehle ki date
+    try {
+      const auth = await shopify.authenticate.admin(request);
+      adminClient = auth.admin;
+    } catch (e) {
+      // Agar external cron-job se call aayi hai to database se offline session uthayen
+      const session = await prisma.session.findFirst({
+        where: { isOnline: false },
+        orderBy: { id: "desc" },
+      }) || await prisma.session.findFirst({
+        orderBy: { id: "desc" },
+      });
+
+      if (!session) {
+        return jsonResponse({ success: false, error: "No active Shopify session found in database." }, 401);
+      }
+
+      const client = new shopify.api.clients.Graphql({ session });
+      adminClient = {
+        graphql: async (query, options) => {
+          return client.query({
+            data: {
+              query,
+              variables: options?.variables,
+            },
+          });
+        },
+      };
+    }
+
+    // 2. Cutoff date: Aaj se 3 months purani date
     const cutoffDate = new Date();
     cutoffDate.setMonth(cutoffDate.getMonth() - 3);
 
@@ -20,7 +51,7 @@ export const loader = async ({ request }) => {
     let updatedCount = 0;
 
     while (hasNextPage) {
-      const response = await admin.graphql(
+      const response = await adminClient.graphql(
         `#graphql
         query getProductsForB2G1($cursor: String) {
           products(first: 50, after: $cursor) {
@@ -41,7 +72,7 @@ export const loader = async ({ request }) => {
         { variables: { cursor } }
       );
 
-      const payload = await response.json();
+      const payload = response.body ? response.body : await response.json();
       const products = payload.data?.products?.nodes || [];
 
       for (const product of products) {
@@ -49,16 +80,14 @@ export const loader = async ({ request }) => {
         const hasExclude = tags.includes("exclude-b2g1");
         const hasTag = tags.includes("b2g1-eligible");
 
-        // Agar release_date metafield khali hai to skip
         if (!product.releaseDate?.value) continue;
 
         const releaseDate = new Date(product.releaseDate.value);
         const isEligible = releaseDate <= cutoffDate;
 
-        // Rule 1: 3 months se purana hai aur exclude nahi kiya
         if (isEligible && !hasExclude) {
           if (!hasTag) {
-            await admin.graphql(
+            await adminClient.graphql(
               `#graphql
               mutation addTag($id: ID!, $tags: [String!]!) {
                 tagsAdd(id: $id, tags: $tags) {
@@ -69,11 +98,9 @@ export const loader = async ({ request }) => {
             );
             updatedCount++;
           }
-        } 
-        // Rule 2: Agar exclude tag laga diya ya 3 months nahi huye
-        else {
+        } else {
           if (hasTag) {
-            await admin.graphql(
+            await adminClient.graphql(
               `#graphql
               mutation removeTag($id: ID!, $tags: [String!]!) {
                 tagsRemove(id: $id, tags: $tags) {
