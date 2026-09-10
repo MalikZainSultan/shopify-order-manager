@@ -8,25 +8,23 @@ const jsonResponse = (data, status = 200) => {
   });
 };
 
+// Rate-limiting delay helper
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export const loader = async ({ request }) => {
   try {
     let admin = null;
 
-    // 1. Shopify App Dashboard se request aaye
+    // 1. Shopify Admin UI / Dashboard ya External Cron session
     try {
       const auth = await authenticate.admin(request);
       admin = auth.admin;
     } catch {
-      // 2. External Cron Job se request aaye
       const url = new URL(request.url);
       const shopParam = url.searchParams.get("shop") || "yppy8z-d9.myshopify.com";
 
       const session = await prisma.session.findFirst({
-        where: {
-          shop: {
-            contains: shopParam.replace(".myshopify.com", ""),
-          },
-        },
+        where: { shop: { contains: shopParam.replace(".myshopify.com", "") } },
         orderBy: { id: "desc" },
       }) || await prisma.session.findFirst({
         orderBy: { id: "desc" },
@@ -35,28 +33,22 @@ export const loader = async ({ request }) => {
       if (!session) {
         return jsonResponse({
           success: false,
-          message: "No active session in database. Please open App Dashboard once.",
+          message: "No active session found in database.",
         }, 200);
       }
 
-      // Shopify client initialize
       const client = new shopify.api.clients.Graphql({ session });
       admin = {
         graphql: async (query, options) => {
           const res = await client.query({
-            data: {
-              query,
-              variables: options?.variables,
-            },
+            data: { query, variables: options?.variables },
           });
-          return {
-            json: async () => res.body,
-          };
+          return { json: async () => res.body };
         },
       };
     }
 
-    // 3. Cutoff Date: Aaj se 90 din (3 months) pehle
+    // 2. Cutoff Date: Aaj se 90 din (3 months) pehle
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - 90);
 
@@ -94,9 +86,16 @@ export const loader = async ({ request }) => {
         const hasExclude = tags.includes("exclude-b2g1");
         const hasTag = tags.includes("b2g1-eligible");
 
-        if (!product.releaseDate?.value) continue;
+        // Agar release date missing ya empty ho to skip karein (Crash se bachata hai)
+        if (!product.releaseDate?.value || product.releaseDate.value.trim() === "") {
+          continue;
+        }
 
         const releaseDate = new Date(product.releaseDate.value);
+        if (isNaN(releaseDate.getTime())) {
+          continue; // Invalid date format par crash nahi hone dega
+        }
+
         const isEligible = releaseDate <= cutoffDate;
 
         if (isEligible && !hasExclude) {
@@ -111,6 +110,7 @@ export const loader = async ({ request }) => {
               { variables: { id: product.id, tags: ["b2g1-eligible"] } }
             );
             updatedCount++;
+            await sleep(50); // Shopify rate limit safe pause
           }
         } else {
           if (hasTag) {
@@ -124,6 +124,7 @@ export const loader = async ({ request }) => {
               { variables: { id: product.id, tags: ["b2g1-eligible"] } }
             );
             updatedCount++;
+            await sleep(50); // Shopify rate limit safe pause
           }
         }
       }
@@ -134,7 +135,8 @@ export const loader = async ({ request }) => {
 
     return jsonResponse({ success: true, updatedCount });
   } catch (error) {
-    console.error("Cron Error Log:", error);
-    return jsonResponse({ success: false, error: error.message || "Unknown error" }, 200);
+    console.error("B2G1 Sync Error:", error);
+    // Hamesha 200 return karega taake front-end ya cron 500 error pe crash na ho
+    return jsonResponse({ success: false, error: error.message || "Unknown sync error" }, 200);
   }
 };
