@@ -19,6 +19,7 @@ import {
   EmptyState,
   Divider,
   Tooltip,
+  ProgressBar,
   AppProvider as PolarisProvider,
 } from "@shopify/polaris";
 import {
@@ -42,11 +43,11 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FETCHING ENGINE (ALL ORDERS - NO LIMIT)       */
+/*  1. GRAPHQL BATCH LOADER (NO ORDER LIMITS)                         */
 /* ------------------------------------------------------------------ */
 
-const ALL_ORDERS_QUERY = `#graphql
-  query FetchReleaseQueue($cursor: String) {
+const BATCH_ORDERS_QUERY = `#graphql
+  query FetchReleaseQueueBatch($cursor: String) {
     orders(
       first: 50
       after: $cursor
@@ -109,41 +110,27 @@ const ALL_ORDERS_QUERY = `#graphql
   }
 `;
 
-async function fetchAllOrders(admin) {
-  const orders = [];
-  let cursor = null;
-  let hasNextPage = true;
-
-  while (hasNextPage) {
-    try {
-      const response = await admin.graphql(ALL_ORDERS_QUERY, {
-        variables: { cursor },
-      });
-      const payload = await response.json();
-
-      if (payload.errors) {
-        console.error("GraphQL Execution Errors:", JSON.stringify(payload.errors, null, 2));
-        break;
-      }
-
-      const ordersConnection = payload.data?.orders;
-      if (ordersConnection?.edges) {
-        orders.push(...ordersConnection.edges.map((edge) => edge.node));
-      }
-
-      hasNextPage = ordersConnection?.pageInfo?.hasNextPage || false;
-      cursor = ordersConnection?.pageInfo?.endCursor || null;
-    } catch (err) {
-      console.error("Pipeline Fetch Error:", err);
-      break;
-    }
+// Helper: 1 batch (50 orders) fetch karega
+async function fetchOrderBatch(admin, cursor = null) {
+  try {
+    const response = await admin.graphql(BATCH_ORDERS_QUERY, {
+      variables: { cursor },
+    });
+    const payload = await response.json();
+    const ordersConnection = payload.data?.orders;
+    return {
+      orders: ordersConnection?.edges?.map((edge) => edge.node) || [],
+      hasNextPage: ordersConnection?.pageInfo?.hasNextPage || false,
+      endCursor: ordersConnection?.pageInfo?.endCursor || null,
+    };
+  } catch (err) {
+    console.error("Batch Fetch Error:", err);
+    return { orders: [], hasNextPage: false, endCursor: null };
   }
-
-  return orders;
 }
 
 /* ------------------------------------------------------------------ */
-/*  2. DATA PROCESSING & GROUPING RUNTIME                             */
+/*  2. RUNTIME PROCESSING & GROUPING HELPERS                          */
 /* ------------------------------------------------------------------ */
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
@@ -184,10 +171,7 @@ function detectChannel(order) {
   const hasEbayTag = tagList.some((t) => t.includes("ebay") || t.includes("cedcommerce"));
   const isEbayOrderNumber = orderName.includes("ebay") || /^\d{2}-\d{5}-\d{5}/.test(order.name ? order.name.trim() : "");
 
-  if (hasEbayTag || isEbayOrderNumber) {
-    return "ebay";
-  }
-
+  if (hasEbayTag || isEbayOrderNumber) return "ebay";
   if (tagList.some((t) => t.includes("whatnot"))) return "whatnot";
   return "shopify";
 }
@@ -216,7 +200,6 @@ function buildCustomerKey(order) {
 
 function processOrder(rawOrder, today) {
   if (!rawOrder.lineItems?.edges) return null;
-
   const allRawItems = rawOrder.lineItems.edges.map((edge) => edge.node);
   if (allRawItems.length === 0) return null;
 
@@ -433,13 +416,8 @@ function processOrders(rawOrders) {
 
     allOrdersList.push(processed);
 
-    if (processed.hasUnfulfilled) {
-      buckets.allUnfulfilled.push(processed);
-    }
-
-    if (buckets[processed.bucket]) {
-      buckets[processed.bucket].push(processed);
-    }
+    if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
+    if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
 
     if (processed.bucket === "partiallyReady") {
       processed.lineItems
@@ -458,8 +436,6 @@ function processOrders(rawOrders) {
         });
     }
   }
-
-  const focPullList = buildFocPullList(buckets.waitingOnRelease);
 
   return {
     allOrdersGrouped: groupByCustomer(allOrdersList),
@@ -482,28 +458,39 @@ function processOrders(rawOrders) {
       cancelled: buckets.cancelled.length,
     },
     pullListItems: pullListItems.sort((a, b) => (b.daysPastRelease || 0) - (a.daysPastRelease || 0)),
-    focPullList,
+    focPullList: buildFocPullList(buckets.waitingOnRelease),
   };
 }
 
+/* ------------------------------------------------------------------ */
+/*  3. LOADER & BATCH ACTION ENDPOINTS                                */
+/* ------------------------------------------------------------------ */
+
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
-  const rawOrders = await fetchAllOrders(admin);
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processOrders(rawOrders);
+  const url = new URL(request.url);
+  const cursor = url.searchParams.get("cursor") || null;
+  const isBatchOnly = url.searchParams.get("batch") === "true";
+
+  // Agar batch cursor request hai to sirf batch return karein
+  if (isBatchOnly) {
+    const batchData = await fetchOrderBatch(admin, cursor);
+    return jsonResponse(batchData);
+  }
+
+  // Pehla fast batch (first 50 orders) utha kar page foran render karein
+  const firstBatch = await fetchOrderBatch(admin, null);
 
   return jsonResponse({
-    allOrdersGrouped,
-    groups,
-    counts,
-    pullListItems,
-    focPullList,
-    totalOrdersCount: rawOrders.length,
+    initialOrders: firstBatch.orders,
+    hasNextPage: firstBatch.hasNextPage,
+    nextCursor: firstBatch.endCursor,
     fetchedAt: new Date().toISOString(),
   });
 };
 
 /* ------------------------------------------------------------------ */
-/*  3. USER INTERFACE COMPONENTS                                      */
+/*  4. UI COMPONENTS                                                  */
 /* ------------------------------------------------------------------ */
 
 const CHANNEL_OPTIONS = [
@@ -867,25 +854,73 @@ function FocPullListView({ focGroups }) {
 }
 
 export default function FulfillmentDashboard() {
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt, totalOrdersCount } = useLoaderData();
+  const { initialOrders, hasNextPage: initialHasNext, nextCursor: initialCursor, fetchedAt } = useLoaderData();
 
-  // Orders Quick Sync Fetcher (Manual & Auto Refresh)
-  const ordersFetcher = useFetcher();
-  const isSyncingOrders = ordersFetcher.state === "submitting" || ordersFetcher.state === "loading";
+  // State: Accumulated raw orders without limit
+  const [accumulatedOrders, setAccumulatedOrders] = useState(initialOrders || []);
+  const [isSyncingAll, setIsSyncingAll] = useState(Boolean(initialHasNext));
+  const [syncProgress, setSyncProgress] = useState({ fetched: (initialOrders || []).length, isComplete: !initialHasNext });
 
-  const handleSyncOrdersNow = () => {
-    ordersFetcher.load("/app/order-dashboard");
-  };
-
-  // 1-Hour Automated Auto-Polling on Active Browser
+  // Background Batch Streaming Engine (Zero Limit)
   useEffect(() => {
-    const ONE_HOUR = 60 * 60 * 1000;
-    const interval = setInterval(() => {
-      ordersFetcher.load("/app/order-dashboard");
-    }, ONE_HOUR);
+    let isCancelled = false;
 
-    return () => clearInterval(interval);
-  }, []);
+    async function streamAllRemainingOrders(cursor) {
+      let currentCursor = cursor;
+      let hasMore = true;
+
+      while (hasMore && !isCancelled) {
+        try {
+          const res = await fetch(`/app/order-dashboard?batch=true&cursor=${encodeURIComponent(currentCursor)}`);
+          const data = await res.json();
+
+          if (data?.orders?.length > 0) {
+            setAccumulatedOrders((prev) => {
+              const existingIds = new Set(prev.map((o) => o.id));
+              const newUnique = data.orders.filter((o) => !existingIds.has(o.id));
+              return [...prev, ...newUnique];
+            });
+
+            setSyncProgress((prev) => ({
+              fetched: prev.fetched + data.orders.length,
+              isComplete: !data.hasNextPage,
+            }));
+          }
+
+          hasMore = data.hasNextPage;
+          currentCursor = data.endCursor;
+        } catch (err) {
+          console.error("Stream error:", err);
+          hasMore = false;
+        }
+      }
+
+      if (!isCancelled) {
+        setIsSyncingAll(false);
+      }
+    }
+
+    if (initialHasNext && initialCursor) {
+      setIsSyncingAll(true);
+      streamAllRemainingOrders(initialCursor);
+    }
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [initialHasNext, initialCursor]);
+
+  // Process all ingested orders in-memory
+  const processedData = useMemo(() => {
+    return processOrders(accumulatedOrders);
+  }, [accumulatedOrders]);
+
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processedData;
+
+  // Manual Full Sync Trigger
+  const handleFullResync = () => {
+    window.location.reload();
+  };
 
   // B2G1 Promotion Automation State Hook
   const b2g1Fetcher = useFetcher();
@@ -950,15 +985,28 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Total Active Ingestion: ${totalOrdersCount ?? allOrdersGrouped.length} Orders`}
+        subtitle={`Metafield Synchronization Queue Engine • Total Ingested Orders: ${accumulatedOrders.length}`}
         primaryAction={{
-          content: "Sync Orders Now",
+          content: isSyncingAll ? "Syncing Background..." : "Sync All Orders Now",
           icon: RefreshIcon,
-          loading: isSyncingOrders,
-          onAction: handleSyncOrdersNow,
+          loading: isSyncingAll,
+          onAction: handleFullResync,
         }}
       >
         <Layout>
+          {isSyncingAll && (
+            <Layout.Section>
+              <Banner tone="info">
+                <BlockStack gap="200">
+                  <Text as="p" fontWeight="semibold">
+                    Ingesting Complete Order History in Background: {accumulatedOrders.length} orders loaded so far...
+                  </Text>
+                  <ProgressBar size="small" tone="primary" />
+                </BlockStack>
+              </Banner>
+            </Layout.Section>
+          )}
+
           <Layout.Section>
             <Card padding="0">
               <Tabs
