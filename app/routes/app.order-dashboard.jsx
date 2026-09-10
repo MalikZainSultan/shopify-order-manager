@@ -42,13 +42,13 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FETCHING ENGINE (0 SE LE KAR AB TAK KE SAB)   */
+/*  1. UNLIMITED GRAPHQL FETCHING ENGINE                              */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
-  query FetchAllStoreOrders($cursor: String) {
+  query FetchReleaseQueue($cursor: String) {
     orders(
-      first: 250
+      first: 50
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
@@ -81,7 +81,7 @@ const ALL_ORDERS_QUERY = `#graphql
             zip
             country
           }
-          lineItems(first: 30) {
+          lineItems(first: 50) {
             edges {
               node {
                 id
@@ -109,52 +109,37 @@ const ALL_ORDERS_QUERY = `#graphql
   }
 `;
 
-const delay = (ms) => new Promise((res) => setTimeout(res, ms));
-
 async function fetchAllOrders(admin) {
-  const allOrders = [];
+  const orders = [];
   let cursor = null;
   let hasNextPage = true;
-  let pageCount = 1;
 
-  // Jab tak aakhri page khatam nahi hota loop chalti rahegi
   while (hasNextPage) {
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
         variables: { cursor },
       });
+      const payload = await response.json();
 
-      const payload = response.body ? response.body : await response.json();
-
-      // Agar Shopify rate-limit warning de to loop todein nahi, wait karein
       if (payload.errors) {
-        console.warn("Shopify API Throttled - Pausing 1.5s before retry...", payload.errors);
-        await delay(1500);
-        continue;
+        console.error("GraphQL Execution Errors:", JSON.stringify(payload.errors, null, 2));
+        break;
       }
 
       const ordersConnection = payload.data?.orders;
-      const nodes = ordersConnection?.edges?.map((edge) => edge.node) || [];
-      allOrders.push(...nodes);
-
-      hasNextPage = Boolean(ordersConnection?.pageInfo?.hasNextPage);
-      cursor = ordersConnection?.pageInfo?.endCursor || null;
-
-      console.log(`Ingested Batch #${pageCount}: +${nodes.length} orders | Total so far: ${allOrders.length}`);
-      pageCount++;
-
-      // Next batch se pehle safety pause taake API quota kabhi block na ho
-      if (hasNextPage) {
-        await delay(200);
+      if (ordersConnection?.edges) {
+        orders.push(...ordersConnection.edges.map((edge) => edge.node));
       }
+
+      hasNextPage = ordersConnection?.pageInfo?.hasNextPage || false;
+      cursor = ordersConnection?.pageInfo?.endCursor || null;
     } catch (err) {
-      console.error("Order fetch pipeline error, retrying after pause:", err);
-      await delay(2000);
+      console.error("Pipeline Fetch Error:", err);
+      break;
     }
   }
 
-  console.log(`Ingestion Complete! Total Store Orders Ingested: ${allOrders.length}`);
-  return allOrders;
+  return orders;
 }
 
 /* ------------------------------------------------------------------ */
@@ -448,8 +433,13 @@ function processOrders(rawOrders) {
 
     allOrdersList.push(processed);
 
-    if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
-    if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
+    if (processed.hasUnfulfilled) {
+      buckets.allUnfulfilled.push(processed);
+    }
+
+    if (buckets[processed.bucket]) {
+      buckets[processed.bucket].push(processed);
+    }
 
     if (processed.bucket === "partiallyReady") {
       processed.lineItems
@@ -468,6 +458,8 @@ function processOrders(rawOrders) {
         });
     }
   }
+
+  const focPullList = buildFocPullList(buckets.waitingOnRelease);
 
   return {
     allOrdersGrouped: groupByCustomer(allOrdersList),
@@ -490,7 +482,7 @@ function processOrders(rawOrders) {
       cancelled: buckets.cancelled.length,
     },
     pullListItems: pullListItems.sort((a, b) => (b.daysPastRelease || 0) - (a.daysPastRelease || 0)),
-    focPullList: buildFocPullList(buckets.waitingOnRelease),
+    focPullList,
   };
 }
 
@@ -505,7 +497,6 @@ export const loader = async ({ request }) => {
     counts,
     pullListItems,
     focPullList,
-    totalOrdersCount: rawOrders.length,
     fetchedAt: new Date().toISOString(),
   });
 };
@@ -875,14 +866,7 @@ function FocPullListView({ focGroups }) {
 }
 
 export default function FulfillmentDashboard() {
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt, totalOrdersCount } = useLoaderData();
-
-  // Manual Reload / Refresh Trigger
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const handleManualSync = () => {
-    setIsRefreshing(true);
-    window.location.reload();
-  };
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt } = useLoaderData();
 
   // B2G1 Promotion Automation State Hook
   const b2g1Fetcher = useFetcher();
@@ -947,13 +931,7 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Total Store Ingestion: ${totalOrdersCount} Orders Active`}
-        primaryAction={{
-          content: "Sync Orders Now",
-          icon: RefreshIcon,
-          loading: isRefreshing,
-          onAction: handleManualSync,
-        }}
+        subtitle="Metafield Synchronization Queue Engine (Zero Manual Tagging Active)"
       >
         <Layout>
           <Layout.Section>
