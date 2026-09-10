@@ -42,11 +42,11 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FETCHING ENGINE                              */
+/*  1. UNLIMITED GRAPHQL FETCHING (SAFE COST PAGINATION ENGINE)        */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
-  query FetchReleaseQueue($cursor: String) {
+  query FetchAllStoreOrders($cursor: String) {
     orders(
       first: 50
       after: $cursor
@@ -81,7 +81,7 @@ const ALL_ORDERS_QUERY = `#graphql
             zip
             country
           }
-          lineItems(first: 50) {
+          lineItems(first: 20) {
             edges {
               node {
                 id
@@ -110,7 +110,7 @@ const ALL_ORDERS_QUERY = `#graphql
 `;
 
 async function fetchAllOrders(admin) {
-  const orders = [];
+  const allOrders = [];
   let cursor = null;
   let hasNextPage = true;
 
@@ -119,27 +119,31 @@ async function fetchAllOrders(admin) {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
         variables: { cursor },
       });
+
       const payload = await response.json();
 
       if (payload.errors) {
-        console.error("GraphQL Execution Errors:", JSON.stringify(payload.errors, null, 2));
+        console.error("Shopify GraphQL Error:", payload.errors);
         break;
       }
 
-      const ordersConnection = payload.data?.orders;
-      if (ordersConnection?.edges) {
-        orders.push(...ordersConnection.edges.map((edge) => edge.node));
+      const ordersData = payload.data?.orders;
+      if (!ordersData?.edges) {
+        break;
       }
 
-      hasNextPage = ordersConnection?.pageInfo?.hasNextPage || false;
-      cursor = ordersConnection?.pageInfo?.endCursor || null;
+      const currentBatch = ordersData.edges.map((edge) => edge.node);
+      allOrders.push(...currentBatch);
+
+      hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
+      cursor = ordersData.pageInfo?.endCursor || null;
     } catch (err) {
       console.error("Pipeline Fetch Error:", err);
       break;
     }
   }
 
-  return orders;
+  return allOrders;
 }
 
 /* ------------------------------------------------------------------ */
@@ -433,13 +437,8 @@ function processOrders(rawOrders) {
 
     allOrdersList.push(processed);
 
-    if (processed.hasUnfulfilled) {
-      buckets.allUnfulfilled.push(processed);
-    }
-
-    if (buckets[processed.bucket]) {
-      buckets[processed.bucket].push(processed);
-    }
+    if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
+    if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
 
     if (processed.bucket === "partiallyReady") {
       processed.lineItems
@@ -497,6 +496,7 @@ export const loader = async ({ request }) => {
     counts,
     pullListItems,
     focPullList,
+    totalOrdersCount: rawOrders.length,
     fetchedAt: new Date().toISOString(),
   });
 };
@@ -866,9 +866,14 @@ function FocPullListView({ focGroups }) {
 }
 
 export default function FulfillmentDashboard() {
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt } = useLoaderData();
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt, totalOrdersCount } = useLoaderData();
 
-  // B2G1 Promotion Automation State Hook
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const handleManualSync = () => {
+    setIsRefreshing(true);
+    window.location.reload();
+  };
+
   const b2g1Fetcher = useFetcher();
   const isSyncingB2G1 = b2g1Fetcher.state === "submitting" || b2g1Fetcher.state === "loading";
 
@@ -931,7 +936,13 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle="Metafield Synchronization Queue Engine (Zero Manual Tagging Active)"
+        subtitle={`Metafield Synchronization Queue Engine • Total Store Ingestion: ${totalOrdersCount} Orders Active`}
+        primaryAction={{
+          content: "Sync Orders Now",
+          icon: RefreshIcon,
+          loading: isRefreshing,
+          onAction: handleManualSync,
+        }}
       >
         <Layout>
           <Layout.Section>
