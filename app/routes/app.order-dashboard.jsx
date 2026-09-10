@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useCallback } from "react";
+import React, { useMemo, useState, useCallback, useEffect } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import {
   Page,
@@ -42,7 +42,7 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FETCHING ENGINE                              */
+/*  1. UNLIMITED GRAPHQL FETCHING ENGINE (ALL ORDERS - NO LIMIT)       */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
@@ -497,6 +497,7 @@ export const loader = async ({ request }) => {
     counts,
     pullListItems,
     focPullList,
+    totalOrdersCount: rawOrders.length,
     fetchedAt: new Date().toISOString(),
   });
 };
@@ -866,7 +867,25 @@ function FocPullListView({ focGroups }) {
 }
 
 export default function FulfillmentDashboard() {
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt } = useLoaderData();
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt, totalOrdersCount } = useLoaderData();
+
+  // Orders Quick Sync Fetcher (Manual & Auto Refresh)
+  const ordersFetcher = useFetcher();
+  const isSyncingOrders = ordersFetcher.state === "submitting" || ordersFetcher.state === "loading";
+
+  const handleSyncOrdersNow = () => {
+    ordersFetcher.load("/app/order-dashboard");
+  };
+
+  // 1-Hour Automated Auto-Polling on Active Browser
+  useEffect(() => {
+    const ONE_HOUR = 60 * 60 * 1000;
+    const interval = setInterval(() => {
+      ordersFetcher.load("/app/order-dashboard");
+    }, ONE_HOUR);
+
+    return () => clearInterval(interval);
+  }, []);
 
   // B2G1 Promotion Automation State Hook
   const b2g1Fetcher = useFetcher();
@@ -931,7 +950,13 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle="Metafield Synchronization Queue Engine (Zero Manual Tagging Active)"
+        subtitle={`Metafield Synchronization Queue Engine • Total Active Ingestion: ${totalOrdersCount ?? allOrdersGrouped.length} Orders`}
+        primaryAction={{
+          content: "Sync Orders Now",
+          icon: RefreshIcon,
+          loading: isSyncingOrders,
+          onAction: handleSyncOrdersNow,
+        }}
       >
         <Layout>
           <Layout.Section>
