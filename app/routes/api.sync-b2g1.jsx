@@ -12,38 +12,34 @@ export const loader = async ({ request }) => {
   try {
     let admin = null;
 
-    // 1. Agar Shopify Admin UI / Dashboard se request aayi ho
+    // 1. Shopify App Dashboard se request aaye
     try {
       const auth = await authenticate.admin(request);
       admin = auth.admin;
     } catch {
-      // 2. Agar External Cron-Job se request aayi ho
+      // 2. External Cron Job se request aaye
       const url = new URL(request.url);
       const shopParam = url.searchParams.get("shop") || "yppy8z-d9.myshopify.com";
 
-      // Database se session uthayen
-      let session = await prisma.session.findFirst({
-        where: { shop: { contains: shopParam.replace(".myshopify.com", "") } },
+      const session = await prisma.session.findFirst({
+        where: {
+          shop: {
+            contains: shopParam.replace(".myshopify.com", ""),
+          },
+        },
+        orderBy: { id: "desc" },
+      }) || await prisma.session.findFirst({
         orderBy: { id: "desc" },
       });
 
       if (!session) {
-        session = await prisma.session.findFirst({
-          orderBy: { id: "desc" },
-        });
+        return jsonResponse({
+          success: false,
+          message: "No active session in database. Please open App Dashboard once.",
+        }, 200);
       }
 
-      if (!session || !session.accessToken) {
-        return jsonResponse(
-          {
-            success: false,
-            error: "Shopify session not found. Please open the App Dashboard once to initialize session.",
-          },
-          200
-        );
-      }
-
-      // Graphql client direct session se banayein
+      // Shopify client initialize
       const client = new shopify.api.clients.Graphql({ session });
       admin = {
         graphql: async (query, options) => {
@@ -60,9 +56,9 @@ export const loader = async ({ request }) => {
       };
     }
 
-    // 3. Cutoff Date: Aaj se 3 months purani date
+    // 3. Cutoff Date: Aaj se 90 din (3 months) pehle
     const cutoffDate = new Date();
-    cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+    cutoffDate.setDate(cutoffDate.getDate() - 90);
 
     let hasNextPage = true;
     let cursor = null;
@@ -138,7 +134,7 @@ export const loader = async ({ request }) => {
 
     return jsonResponse({ success: true, updatedCount });
   } catch (error) {
-    console.error("B2G1 Sync Error:", error);
-    return jsonResponse({ success: false, error: error.message }, 500);
+    console.error("Cron Error Log:", error);
+    return jsonResponse({ success: false, error: error.message || "Unknown error" }, 200);
   }
 };
