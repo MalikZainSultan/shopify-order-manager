@@ -1,5 +1,5 @@
 import prisma from "../db.server";
-import shopify from "../shopify.server";
+import shopify, { authenticate } from "../shopify.server";
 
 const jsonResponse = (data, status = 200) => {
   return new Response(JSON.stringify(data), {
@@ -10,39 +10,57 @@ const jsonResponse = (data, status = 200) => {
 
 export const loader = async ({ request }) => {
   try {
-    // 1. Session dhoondein (Chahe Shopify Admin se ho ya external Cron Job se)
-    let adminClient = null;
+    let admin = null;
 
+    // 1. Agar Shopify Admin UI / Dashboard se request aayi ho
     try {
-      const auth = await shopify.authenticate.admin(request);
-      adminClient = auth.admin;
-    } catch (e) {
-      // Agar external cron-job se call aayi hai to database se offline session uthayen
-      const session = await prisma.session.findFirst({
-        where: { isOnline: false },
-        orderBy: { id: "desc" },
-      }) || await prisma.session.findFirst({
+      const auth = await authenticate.admin(request);
+      admin = auth.admin;
+    } catch {
+      // 2. Agar External Cron-Job se request aayi ho
+      const url = new URL(request.url);
+      const shopParam = url.searchParams.get("shop") || "yppy8z-d9.myshopify.com";
+
+      // Database se session uthayen
+      let session = await prisma.session.findFirst({
+        where: { shop: { contains: shopParam.replace(".myshopify.com", "") } },
         orderBy: { id: "desc" },
       });
 
       if (!session) {
-        return jsonResponse({ success: false, error: "No active Shopify session found in database." }, 401);
+        session = await prisma.session.findFirst({
+          orderBy: { id: "desc" },
+        });
       }
 
+      if (!session || !session.accessToken) {
+        return jsonResponse(
+          {
+            success: false,
+            error: "Shopify session not found. Please open the App Dashboard once to initialize session.",
+          },
+          200
+        );
+      }
+
+      // Graphql client direct session se banayein
       const client = new shopify.api.clients.Graphql({ session });
-      adminClient = {
+      admin = {
         graphql: async (query, options) => {
-          return client.query({
+          const res = await client.query({
             data: {
               query,
               variables: options?.variables,
             },
           });
+          return {
+            json: async () => res.body,
+          };
         },
       };
     }
 
-    // 2. Cutoff date: Aaj se 3 months purani date
+    // 3. Cutoff Date: Aaj se 3 months purani date
     const cutoffDate = new Date();
     cutoffDate.setMonth(cutoffDate.getMonth() - 3);
 
@@ -51,7 +69,7 @@ export const loader = async ({ request }) => {
     let updatedCount = 0;
 
     while (hasNextPage) {
-      const response = await adminClient.graphql(
+      const response = await admin.graphql(
         `#graphql
         query getProductsForB2G1($cursor: String) {
           products(first: 50, after: $cursor) {
@@ -72,7 +90,7 @@ export const loader = async ({ request }) => {
         { variables: { cursor } }
       );
 
-      const payload = response.body ? response.body : await response.json();
+      const payload = await response.json();
       const products = payload.data?.products?.nodes || [];
 
       for (const product of products) {
@@ -87,7 +105,7 @@ export const loader = async ({ request }) => {
 
         if (isEligible && !hasExclude) {
           if (!hasTag) {
-            await adminClient.graphql(
+            await admin.graphql(
               `#graphql
               mutation addTag($id: ID!, $tags: [String!]!) {
                 tagsAdd(id: $id, tags: $tags) {
@@ -100,7 +118,7 @@ export const loader = async ({ request }) => {
           }
         } else {
           if (hasTag) {
-            await adminClient.graphql(
+            await admin.graphql(
               `#graphql
               mutation removeTag($id: ID!, $tags: [String!]!) {
                 tagsRemove(id: $id, tags: $tags) {
