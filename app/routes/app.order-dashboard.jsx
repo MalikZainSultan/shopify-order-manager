@@ -43,13 +43,13 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. GRAPHQL BATCH LOADER (NO ORDER LIMITS)                         */
+/*  1. ZERO LIMIT FULL STORE INGESTION ENGINE (ALL ORDERS FOREVER)    */
 /* ------------------------------------------------------------------ */
 
-const BATCH_ORDERS_QUERY = `#graphql
-  query FetchReleaseQueueBatch($cursor: String) {
+const ALL_ORDERS_QUERY = `#graphql
+  query FetchAllStoreOrders($cursor: String) {
     orders(
-      first: 50
+      first: 250
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
@@ -82,7 +82,7 @@ const BATCH_ORDERS_QUERY = `#graphql
             zip
             country
           }
-          lineItems(first: 50) {
+          lineItems(first: 30) {
             edges {
               node {
                 id
@@ -110,23 +110,51 @@ const BATCH_ORDERS_QUERY = `#graphql
   }
 `;
 
-// Helper: 1 batch (50 orders) fetch karega
-async function fetchOrderBatch(admin, cursor = null) {
-  try {
-    const response = await admin.graphql(BATCH_ORDERS_QUERY, {
-      variables: { cursor },
-    });
-    const payload = await response.json();
-    const ordersConnection = payload.data?.orders;
-    return {
-      orders: ordersConnection?.edges?.map((edge) => edge.node) || [],
-      hasNextPage: ordersConnection?.pageInfo?.hasNextPage || false,
-      endCursor: ordersConnection?.pageInfo?.endCursor || null,
-    };
-  } catch (err) {
-    console.error("Batch Fetch Error:", err);
-    return { orders: [], hasNextPage: false, endCursor: null };
+const delay = (ms) => new Promise((res) => setTimeout(res, ms));
+
+async function fetchAllOrders(admin) {
+  const allOrders = [];
+  let cursor = null;
+  let hasNextPage = true;
+  let pageCount = 1;
+
+  while (hasNextPage) {
+    try {
+      const response = await admin.graphql(ALL_ORDERS_QUERY, {
+        variables: { cursor },
+      });
+
+      const payload = response.body ? response.body : await response.json();
+
+      // Agar throttling / cost limit hit ho to 1 second wait karke retry karein
+      if (payload.errors) {
+        console.warn("Shopify Cost Limit - Waiting 1.5s before retry...", payload.errors);
+        await delay(1500);
+        continue;
+      }
+
+      const ordersConnection = payload.data?.orders;
+      const nodes = ordersConnection?.edges?.map((edge) => edge.node) || [];
+      allOrders.push(...nodes);
+
+      hasNextPage = Boolean(ordersConnection?.pageInfo?.hasNextPage);
+      cursor = ordersConnection?.pageInfo?.endCursor || null;
+
+      console.log(`Ingested Batch #${pageCount}: Fetched ${nodes.length} orders. Total so far: ${allOrders.length}`);
+      pageCount++;
+
+      // Shopify rate limit safe pause between 250-order batches
+      if (hasNextPage) {
+        await delay(200);
+      }
+    } catch (err) {
+      console.error("Order fetch error, retrying after pause:", err);
+      await delay(2000);
+    }
   }
+
+  console.log(`Ingestion Complete! Total Store Orders Ingested: ${allOrders.length}`);
+  return allOrders;
 }
 
 /* ------------------------------------------------------------------ */
