@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useCallback, useEffect } from "react";
+import React, { useMemo, useState, useCallback } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import {
   Page,
@@ -19,7 +19,6 @@ import {
   EmptyState,
   Divider,
   Tooltip,
-  ProgressBar,
   AppProvider as PolarisProvider,
 } from "@shopify/polaris";
 import {
@@ -43,7 +42,7 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. ZERO LIMIT FULL STORE INGESTION ENGINE (ALL ORDERS FOREVER)    */
+/*  1. UNLIMITED GRAPHQL FETCHING ENGINE (0 SE LE KAR AB TAK KE SAB)   */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
@@ -118,6 +117,7 @@ async function fetchAllOrders(admin) {
   let hasNextPage = true;
   let pageCount = 1;
 
+  // Jab tak aakhri page khatam nahi hota loop chalti rahegi
   while (hasNextPage) {
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
@@ -126,9 +126,9 @@ async function fetchAllOrders(admin) {
 
       const payload = response.body ? response.body : await response.json();
 
-      // Agar throttling / cost limit hit ho to 1 second wait karke retry karein
+      // Agar Shopify rate-limit warning de to loop todein nahi, wait karein
       if (payload.errors) {
-        console.warn("Shopify Cost Limit - Waiting 1.5s before retry...", payload.errors);
+        console.warn("Shopify API Throttled - Pausing 1.5s before retry...", payload.errors);
         await delay(1500);
         continue;
       }
@@ -140,15 +140,15 @@ async function fetchAllOrders(admin) {
       hasNextPage = Boolean(ordersConnection?.pageInfo?.hasNextPage);
       cursor = ordersConnection?.pageInfo?.endCursor || null;
 
-      console.log(`Ingested Batch #${pageCount}: Fetched ${nodes.length} orders. Total so far: ${allOrders.length}`);
+      console.log(`Ingested Batch #${pageCount}: +${nodes.length} orders | Total so far: ${allOrders.length}`);
       pageCount++;
 
-      // Shopify rate limit safe pause between 250-order batches
+      // Next batch se pehle safety pause taake API quota kabhi block na ho
       if (hasNextPage) {
         await delay(200);
       }
     } catch (err) {
-      console.error("Order fetch error, retrying after pause:", err);
+      console.error("Order fetch pipeline error, retrying after pause:", err);
       await delay(2000);
     }
   }
@@ -158,7 +158,7 @@ async function fetchAllOrders(admin) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  2. RUNTIME PROCESSING & GROUPING HELPERS                          */
+/*  2. DATA PROCESSING & GROUPING RUNTIME                             */
 /* ------------------------------------------------------------------ */
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
@@ -199,7 +199,10 @@ function detectChannel(order) {
   const hasEbayTag = tagList.some((t) => t.includes("ebay") || t.includes("cedcommerce"));
   const isEbayOrderNumber = orderName.includes("ebay") || /^\d{2}-\d{5}-\d{5}/.test(order.name ? order.name.trim() : "");
 
-  if (hasEbayTag || isEbayOrderNumber) return "ebay";
+  if (hasEbayTag || isEbayOrderNumber) {
+    return "ebay";
+  }
+
   if (tagList.some((t) => t.includes("whatnot"))) return "whatnot";
   return "shopify";
 }
@@ -228,6 +231,7 @@ function buildCustomerKey(order) {
 
 function processOrder(rawOrder, today) {
   if (!rawOrder.lineItems?.edges) return null;
+
   const allRawItems = rawOrder.lineItems.edges.map((edge) => edge.node);
   if (allRawItems.length === 0) return null;
 
@@ -490,35 +494,24 @@ function processOrders(rawOrders) {
   };
 }
 
-/* ------------------------------------------------------------------ */
-/*  3. LOADER & BATCH ACTION ENDPOINTS                                */
-/* ------------------------------------------------------------------ */
-
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
-  const url = new URL(request.url);
-  const cursor = url.searchParams.get("cursor") || null;
-  const isBatchOnly = url.searchParams.get("batch") === "true";
-
-  // Agar batch cursor request hai to sirf batch return karein
-  if (isBatchOnly) {
-    const batchData = await fetchOrderBatch(admin, cursor);
-    return jsonResponse(batchData);
-  }
-
-  // Pehla fast batch (first 50 orders) utha kar page foran render karein
-  const firstBatch = await fetchOrderBatch(admin, null);
+  const rawOrders = await fetchAllOrders(admin);
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processOrders(rawOrders);
 
   return jsonResponse({
-    initialOrders: firstBatch.orders,
-    hasNextPage: firstBatch.hasNextPage,
-    nextCursor: firstBatch.endCursor,
+    allOrdersGrouped,
+    groups,
+    counts,
+    pullListItems,
+    focPullList,
+    totalOrdersCount: rawOrders.length,
     fetchedAt: new Date().toISOString(),
   });
 };
 
 /* ------------------------------------------------------------------ */
-/*  4. UI COMPONENTS                                                  */
+/*  3. USER INTERFACE COMPONENTS                                      */
 /* ------------------------------------------------------------------ */
 
 const CHANNEL_OPTIONS = [
@@ -882,71 +875,12 @@ function FocPullListView({ focGroups }) {
 }
 
 export default function FulfillmentDashboard() {
-  const { initialOrders, hasNextPage: initialHasNext, nextCursor: initialCursor, fetchedAt } = useLoaderData();
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt, totalOrdersCount } = useLoaderData();
 
-  // State: Accumulated raw orders without limit
-  const [accumulatedOrders, setAccumulatedOrders] = useState(initialOrders || []);
-  const [isSyncingAll, setIsSyncingAll] = useState(Boolean(initialHasNext));
-  const [syncProgress, setSyncProgress] = useState({ fetched: (initialOrders || []).length, isComplete: !initialHasNext });
-
-  // Background Batch Streaming Engine (Zero Limit)
-  useEffect(() => {
-    let isCancelled = false;
-
-    async function streamAllRemainingOrders(cursor) {
-      let currentCursor = cursor;
-      let hasMore = true;
-
-      while (hasMore && !isCancelled) {
-        try {
-          const res = await fetch(`/app/order-dashboard?batch=true&cursor=${encodeURIComponent(currentCursor)}`);
-          const data = await res.json();
-
-          if (data?.orders?.length > 0) {
-            setAccumulatedOrders((prev) => {
-              const existingIds = new Set(prev.map((o) => o.id));
-              const newUnique = data.orders.filter((o) => !existingIds.has(o.id));
-              return [...prev, ...newUnique];
-            });
-
-            setSyncProgress((prev) => ({
-              fetched: prev.fetched + data.orders.length,
-              isComplete: !data.hasNextPage,
-            }));
-          }
-
-          hasMore = data.hasNextPage;
-          currentCursor = data.endCursor;
-        } catch (err) {
-          console.error("Stream error:", err);
-          hasMore = false;
-        }
-      }
-
-      if (!isCancelled) {
-        setIsSyncingAll(false);
-      }
-    }
-
-    if (initialHasNext && initialCursor) {
-      setIsSyncingAll(true);
-      streamAllRemainingOrders(initialCursor);
-    }
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [initialHasNext, initialCursor]);
-
-  // Process all ingested orders in-memory
-  const processedData = useMemo(() => {
-    return processOrders(accumulatedOrders);
-  }, [accumulatedOrders]);
-
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processedData;
-
-  // Manual Full Sync Trigger
-  const handleFullResync = () => {
+  // Manual Reload / Refresh Trigger
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const handleManualSync = () => {
+    setIsRefreshing(true);
     window.location.reload();
   };
 
@@ -1013,28 +947,15 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Total Ingested Orders: ${accumulatedOrders.length}`}
+        subtitle={`Metafield Synchronization Queue Engine • Total Store Ingestion: ${totalOrdersCount} Orders Active`}
         primaryAction={{
-          content: isSyncingAll ? "Syncing Background..." : "Sync All Orders Now",
+          content: "Sync Orders Now",
           icon: RefreshIcon,
-          loading: isSyncingAll,
-          onAction: handleFullResync,
+          loading: isRefreshing,
+          onAction: handleManualSync,
         }}
       >
         <Layout>
-          {isSyncingAll && (
-            <Layout.Section>
-              <Banner tone="info">
-                <BlockStack gap="200">
-                  <Text as="p" fontWeight="semibold">
-                    Ingesting Complete Order History in Background: {accumulatedOrders.length} orders loaded so far...
-                  </Text>
-                  <ProgressBar size="small" tone="primary" />
-                </BlockStack>
-              </Banner>
-            </Layout.Section>
-          )}
-
           <Layout.Section>
             <Card padding="0">
               <Tabs
