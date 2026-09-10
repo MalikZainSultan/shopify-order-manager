@@ -1,5 +1,11 @@
-import { json } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
+
+const jsonResponse = (data, status = 200) => {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+  });
+};
 
 export const loader = async ({ request }) => {
   try {
@@ -64,7 +70,7 @@ export const loader = async ({ request }) => {
             updatedCount++;
           }
         } 
-        // Rule 2: Agar client ne 'exclude-b2g1' laga diya ya date naye product ki hai
+        // Rule 2: Agar exclude tag laga diya ya 3 months nahi huye
         else {
           if (hasTag) {
             await admin.graphql(
@@ -85,9 +91,9 @@ export const loader = async ({ request }) => {
       cursor = payload.data?.products?.pageInfo?.endCursor || null;
     }
 
-    return json({ success: true, updatedCount });
+    return jsonResponse({ success: true, updatedCount });
   } catch (error) {
     console.error("B2G1 Sync Error:", error);
-    return json({ success: false, error: error.message }, { status: 500 });
+    return jsonResponse({ success: false, error: error.message }, 500);
   }
 };
