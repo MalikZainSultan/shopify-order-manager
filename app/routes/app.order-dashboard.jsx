@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useCallback } from "react";
-import { useLoaderData } from "react-router";
+import { useLoaderData, useFetcher } from "react-router";
 import {
   Page,
   Layout,
@@ -31,6 +31,7 @@ import {
   SearchIcon,
   CalendarIcon,
   ClockIcon,
+  RefreshIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
@@ -867,6 +868,14 @@ function FocPullListView({ focGroups }) {
 export default function FulfillmentDashboard() {
   const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt } = useLoaderData();
 
+  // B2G1 Promotion Automation State Hook
+  const b2g1Fetcher = useFetcher();
+  const isSyncingB2G1 = b2g1Fetcher.state === "submitting" || b2g1Fetcher.state === "loading";
+
+  const handleSyncB2G1 = () => {
+    b2g1Fetcher.load("/api/sync-b2g1");
+  };
+
   const [selectedTab, setSelectedTab] = useState(0);
   const [channelFilter, setChannelFilter] = useState([]);
   const [queryValue, setQueryValue] = useState("");
@@ -1051,6 +1060,44 @@ export default function FulfillmentDashboard() {
                 <Tooltip content="Live query architecture fetches directly from admin datastore.">
                   <Text as="span" tone="subdued">Last Sync Cycle: {new Date(fetchedAt).toLocaleTimeString()}</Text>
                 </Tooltip>
+
+                {/* --- B2G1 AUTOMATION CONTROL SECTION --- */}
+                <Divider />
+                <BlockStack gap="200">
+                  <Text as="h4" variant="headingSm" fontWeight="semibold">
+                    Promotion Automation
+                  </Text>
+                  
+                  {b2g1Fetcher.data?.success && (
+                    <Banner tone="success">
+                      <Text as="p" variant="bodySm">
+                        Promotion synced! Updated {b2g1Fetcher.data.updatedCount ?? 0} eligible products.
+                      </Text>
+                    </Banner>
+                  )}
+
+                  {b2g1Fetcher.data?.error && (
+                    <Banner tone="critical">
+                      <Text as="p" variant="bodySm">
+                        {b2g1Fetcher.data.error}
+                      </Text>
+                    </Banner>
+                  )}
+
+                  <Button
+                    icon={RefreshIcon}
+                    loading={isSyncingB2G1}
+                    onClick={handleSyncB2G1}
+                    fullWidth
+                  >
+                    Sync B2G1 Eligible Products
+                  </Button>
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    Scans books older than 3 months (metafield: custom.release_date) and syncs eligible tags.
+                  </Text>
+                </BlockStack>
+                {/* --- END B2G1 CONTROL SECTION --- */}
+
               </BlockStack>
             </Card>
           </Layout.Section>
