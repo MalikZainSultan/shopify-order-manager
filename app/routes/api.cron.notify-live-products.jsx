@@ -12,7 +12,6 @@
 // showing the Notify Me box) still runs purely off `custom.drop_date` being
 // blank or in the future, same as before. This route only handles the EMAIL side.
 
-import { json } from "@remix-run/node";
 import shopify from "../shopify.server";
 
 const CRON_SECRET = process.env.CRON_SECRET;
@@ -22,11 +21,11 @@ export async function action({ request }) {
   // --- 1. Auth check: only our own cron caller can hit this ---
   const incomingSecret = request.headers.get("x-cron-secret");
   if (!CRON_SECRET || incomingSecret !== CRON_SECRET) {
-    return json({ error: "Unauthorized" }, { status: 401 });
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   if (!SHOP_DOMAIN) {
-    return json({ error: "SHOP_DOMAIN env var is not set" }, { status: 500 });
+    return Response.json({ error: "SHOP_DOMAIN env var is not set" }, { status: 500 });
   }
 
   // --- 2. Load the shop's offline (non-expiring) session so we can call the Admin API ---
@@ -34,7 +33,7 @@ export async function action({ request }) {
   const offlineSession = sessions.find((s) => !s.isOnline);
 
   if (!offlineSession) {
-    return json(
+    return Response.json(
       { error: `No offline session found for ${SHOP_DOMAIN}. Re-install/auth the app once.` },
       { status: 500 }
     );
@@ -146,7 +145,7 @@ export async function action({ request }) {
     });
   }
 
-  return json({ ok: true, checkedProducts: products.length, results });
+  return Response.json({ ok: true, checkedProducts: products.length, results });
 }
 
 // -----------------------------------------------------------------------
