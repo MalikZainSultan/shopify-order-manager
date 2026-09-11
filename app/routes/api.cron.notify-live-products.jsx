@@ -8,7 +8,7 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
 async function handleCronJob(request) {
   try {
-    // --- 1. Auth check: Cron secret verification ---
+    // --- 1. Auth check ---
     const url = new URL(request.url);
     const headerSecret = request.headers.get("x-cron-secret");
     const querySecret = url.searchParams.get("secret");
@@ -40,35 +40,39 @@ async function handleCronJob(request) {
           connectedDomain = domain;
           break;
         }
-      } catch (e) {
-        // Fallback to next domain
-      }
+      } catch (e) {}
     }
 
     if (!offlineSession) {
       return Response.json(
         {
           error: "No offline session found.",
-          details: `Searched in: ${domainsToTry.join(", ")}. Please open the app in Shopify Admin once to authenticate.`,
+          details: `Searched in: ${domainsToTry.join(", ")}. Please open the app in Shopify Admin once.`,
         },
         { status: 500 }
       );
     }
 
-    // --- 3. Unauthenticated GraphQL Admin Context ---
     const { admin } = await shopify.unauthenticated.admin(connectedDomain);
 
+    // --- 3. Targeted Query for Large Stores ---
+    // Multiple query syntaxes use kar rahe hain jo Shopify metafield index match karti hain
+    // Fallback: agar store par products bohot zyada hain to hum targeted query pass karte hain
     const productsResponse = await admin.graphql(
       `#graphql
         query getDropProducts {
-          products(first: 50) {
+          products(first: 50, query: "status:active") {
             edges {
               node {
                 id
                 handle
                 title
-                dropDate: metafield(namespace: "custom", key: "drop_date") { value }
-                notified: metafield(namespace: "custom", key: "notify_sent") { value }
+                dropDate: metafield(namespace: "custom", key: "drop_date") {
+                  value
+                }
+                notified: metafield(namespace: "custom", key: "notify_sent") {
+                  value
+                }
               }
             }
           }
@@ -77,10 +81,39 @@ async function handleCronJob(request) {
     );
 
     const productsJson = await productsResponse.json();
-    const allProducts = productsJson.data?.products?.edges?.map((e) => e.node) || [];
+    let allProducts = productsJson.data?.products?.edges?.map((e) => e.node) || [];
 
-    // Filter only products that have drop_date set
-    const dropProducts = allProducts.filter((p) => p.dropDate?.value);
+    // Filter sirf wahi products jin par dropDate set hai
+    let dropProducts = allProducts.filter((p) => p.dropDate?.value);
+
+    // AGAR dropProducts 0 aayein (kyunki 9000 products hain aur pehle 50 me nahi aayi),
+    // to search query ke sath targetted hit karein:
+    if (dropProducts.length === 0) {
+      const searchResponse = await admin.graphql(
+        `#graphql
+          query searchByMetafield {
+            products(first: 50, query: "custom.drop_date:*") {
+              edges {
+                node {
+                  id
+                  handle
+                  title
+                  dropDate: metafield(namespace: "custom", key: "drop_date") {
+                    value
+                  }
+                  notified: metafield(namespace: "custom", key: "notify_sent") {
+                    value
+                  }
+                }
+              }
+            }
+          }
+        `
+      );
+      const searchJson = await searchResponse.json();
+      const queriedProducts = searchJson.data?.products?.edges?.map((e) => e.node) || [];
+      dropProducts = queriedProducts.filter((p) => p.dropDate?.value);
+    }
 
     const now = new Date();
     const results = [];
@@ -91,14 +124,14 @@ async function handleCronJob(request) {
       if (product.notified?.value === "true") {
         skippedDetails.push({
           handle: product.handle,
-          reason: "Already notified (notify_sent is true)",
+          reason: "Already notified (notify_sent = true)",
         });
         continue;
       }
 
       const dropDate = new Date(product.dropDate.value);
 
-      // 2. Skip if drop date is still in the future
+      // 2. Skip if still in future
       if (dropDate > now) {
         skippedDetails.push({
           handle: product.handle,
@@ -109,12 +142,12 @@ async function handleCronJob(request) {
         continue;
       }
 
-      // --- 4. Tag Matching: Support handles with or without numeric prefix ---
+      // --- 4. Tag Matching (Efficient query for 10k+ customers) ---
       const cleanHandle = product.handle.replace(/^[0-9]+-/, "");
       const numericId = product.id.split("/").pop();
 
-      // Flexible query covers: notify_{handle}, notify_{id}-{handle}, notify_me
-      const searchQuery = `tag:notify_*${product.handle}* OR tag:notify_*${cleanHandle}* OR tag:notify_*${numericId}*`;
+      // Shopify Customer Search Index exact/wildcard match fast karta hai
+      const searchQuery = `tag:notify_*${cleanHandle}* OR tag:notify_*${product.handle}* OR tag:notify_*${numericId}*`;
 
       const customersResponse = await admin.graphql(
         `#graphql
@@ -139,7 +172,7 @@ async function handleCronJob(request) {
       const customersJson = await customersResponse.json();
       const rawCustomers = customersJson.data?.customers?.edges?.map((e) => e.node) || [];
 
-      // Filter in-memory to ensure customer tag strictly matches this product
+      // Ensure customer tag belongs specifically to this product
       const matchedCustomers = rawCustomers.filter((customer) => {
         if (!customer.tags) return false;
         return customer.tags.some(
@@ -150,7 +183,7 @@ async function handleCronJob(request) {
         );
       });
 
-      // --- 5. Dispatch Notification Emails ---
+      // --- 5. Dispatch Emails ---
       const productUrl = `https://leapslair.com/products/${product.handle}`;
       let sentCount = 0;
       const emailLogs = [];
@@ -247,7 +280,7 @@ async function sendNotifyEmail({ to, firstName, productTitle, productUrl }) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: "LeapsLair <onboarding@resend.dev>", // Domain verify hone par: orders@leapslair.com
+      from: "LeapsLair <onboarding@resend.dev>",
       to: [to],
       subject: `🚨 ${productTitle} is NOW LIVE!`,
       html: `
