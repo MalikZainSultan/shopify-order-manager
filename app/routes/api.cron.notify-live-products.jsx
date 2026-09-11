@@ -13,7 +13,7 @@ export async function action({ request }) {
       return Response.json({ error: "Unauthorized: Invalid or missing x-cron-secret" }, { status: 401 });
     }
 
-    // --- 2. Load Offline Session (Fallback support for both domains) ---
+    // --- 2. Load Offline Session ---
     const domainsToTry = [
       SHOP_DOMAIN,
       "yppy8z-d9.myshopify.com",
@@ -47,11 +47,12 @@ export async function action({ request }) {
       );
     }
 
-    const client = new shopify.api.clients.Graphql({ session: offlineSession });
+    // --- 3. GraphQL Query Helper (Using unauthenticated.admin or direct admin context) ---
+    const { admin } = await shopify.unauthenticated.admin(connectedDomain);
 
-    // --- 3. Pull products having drop_date metafield ---
-    const productsResponse = await client.query({
-      data: `#graphql
+    // Pull products having drop_date metafield
+    const productsResponse = await admin.graphql(
+      `#graphql
         query {
           products(first: 100, query: "metafields.custom.drop_date:*") {
             edges {
@@ -66,10 +67,11 @@ export async function action({ request }) {
             }
           }
         }
-      `,
-    });
+      `
+    );
 
-    const products = productsResponse.body?.data?.products?.edges?.map((e) => e.node) || [];
+    const productsJson = await productsResponse.json();
+    const products = productsJson.data?.products?.edges?.map((e) => e.node) || [];
     const now = new Date();
     const results = [];
 
@@ -82,9 +84,9 @@ export async function action({ request }) {
 
       // --- 4. Find customers tagged notify_{{product.handle}} ---
       const tag = `notify_${product.handle}`;
-      const customersResponse = await client.query({
-        data: `#graphql
-          query($searchQuery: String!) {
+      const customersResponse = await admin.graphql(
+        `#graphql
+          query getCustomers($searchQuery: String!) {
             customers(first: 250, query: $searchQuery) {
               edges {
                 node {
@@ -96,10 +98,13 @@ export async function action({ request }) {
             }
           }
         `,
-        variables: { searchQuery: `tag:'${tag}'` },
-      });
+        {
+          variables: { searchQuery: `tag:'${tag}'` },
+        }
+      );
 
-      const customers = customersResponse.body?.data?.customers?.edges?.map((e) => e.node) || [];
+      const customersJson = await customersResponse.json();
+      const customers = customersJson.data?.customers?.edges?.map((e) => e.node) || [];
 
       // --- 5. Clean Storefront URL ---
       const productUrl = `https://leapslair.com/products/${product.handle}`;
@@ -120,27 +125,29 @@ export async function action({ request }) {
         }
       }
 
-      // --- 6. Mark product as notified so it won't trigger again ---
-      await client.query({
-        data: `#graphql
-          mutation($metafields: [MetafieldsSetInput!]!) {
+      // --- 6. Mark product as notified ---
+      await admin.graphql(
+        `#graphql
+          mutation setNotified($metafields: [MetafieldsSetInput!]!) {
             metafieldsSet(metafields: $metafields) {
               userErrors { field message }
             }
           }
         `,
-        variables: {
-          metafields: [
-            {
-              ownerId: product.id,
-              namespace: "custom",
-              key: "notify_sent",
-              type: "boolean",
-              value: "true",
-            },
-          ],
-        },
-      });
+        {
+          variables: {
+            metafields: [
+              {
+                ownerId: product.id,
+                namespace: "custom",
+                key: "notify_sent",
+                type: "boolean",
+                value: "true",
+              },
+            ],
+          },
+        }
+      );
 
       results.push({
         product: product.title,
