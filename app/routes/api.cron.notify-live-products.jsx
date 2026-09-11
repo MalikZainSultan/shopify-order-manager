@@ -8,21 +8,24 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
 async function handleCronJob(request) {
   try {
-    // --- 1. Auth check ---
+    // --- 1. Auth check: Cron secret verification ---
     const url = new URL(request.url);
     const headerSecret = request.headers.get("x-cron-secret");
     const querySecret = url.searchParams.get("secret");
     const incomingSecret = headerSecret || querySecret;
 
     if (!CRON_SECRET || incomingSecret !== CRON_SECRET) {
-      return Response.json({ error: "Unauthorized: Invalid or missing secret" }, { status: 401 });
+      return Response.json(
+        { error: "Unauthorized: Invalid or missing secret" },
+        { status: 401 }
+      );
     }
 
     // --- 2. Load Offline Session ---
     const domainsToTry = [
       SHOP_DOMAIN,
       "yppy8z-d9.myshopify.com",
-      "leapslair.myshopify.com"
+      "leapslair.myshopify.com",
     ];
 
     let offlineSession = null;
@@ -37,23 +40,24 @@ async function handleCronJob(request) {
           connectedDomain = domain;
           break;
         }
-      } catch (e) {}
+      } catch (e) {
+        // Fallback to next domain
+      }
     }
 
     if (!offlineSession) {
       return Response.json(
-        { 
+        {
           error: "No offline session found.",
-          details: `Searched in: ${domainsToTry.join(", ")}. Open app once in Shopify admin.` 
+          details: `Searched in: ${domainsToTry.join(", ")}. Please open the app in Shopify Admin once to authenticate.`,
         },
         { status: 500 }
       );
     }
 
-    // --- 3. GraphQL Client via unauthenticated admin context ---
+    // --- 3. Unauthenticated GraphQL Admin Context ---
     const { admin } = await shopify.unauthenticated.admin(connectedDomain);
 
-    // Pull products with metafields
     const productsResponse = await admin.graphql(
       `#graphql
         query getDropProducts {
@@ -74,7 +78,7 @@ async function handleCronJob(request) {
 
     const productsJson = await productsResponse.json();
     const allProducts = productsJson.data?.products?.edges?.map((e) => e.node) || [];
-    
+
     // Filter only products that have drop_date set
     const dropProducts = allProducts.filter((p) => p.dropDate?.value);
 
@@ -83,30 +87,38 @@ async function handleCronJob(request) {
     const skippedDetails = [];
 
     for (const product of dropProducts) {
-      // Check if already notified
+      // 1. Skip if already notified
       if (product.notified?.value === "true") {
-        skippedDetails.push({ handle: product.handle, reason: "Already notified (notify_sent = true)" });
+        skippedDetails.push({
+          handle: product.handle,
+          reason: "Already notified (notify_sent is true)",
+        });
         continue;
       }
 
       const dropDate = new Date(product.dropDate.value);
 
-      // Check if date is still in future
+      // 2. Skip if drop date is still in the future
       if (dropDate > now) {
         skippedDetails.push({
           handle: product.handle,
           dropDate: product.dropDate.value,
           currentTimeUTC: now.toISOString(),
-          reason: "Drop date is still in future"
+          reason: "Drop date is still in future",
         });
         continue;
       }
 
-      // --- 4. Find customers tagged notify_{{product.handle}} ---
-      const tag = `notify_${product.handle}`;
+      // --- 4. Tag Matching: Support handles with or without numeric prefix ---
+      const cleanHandle = product.handle.replace(/^[0-9]+-/, "");
+      const numericId = product.id.split("/").pop();
+
+      // Flexible query covers: notify_{handle}, notify_{id}-{handle}, notify_me
+      const searchQuery = `tag:notify_*${product.handle}* OR tag:notify_*${cleanHandle}* OR tag:notify_*${numericId}*`;
+
       const customersResponse = await admin.graphql(
         `#graphql
-          query getCustomers($searchQuery: String!) {
+          query getTaggedCustomers($searchQuery: String!) {
             customers(first: 250, query: $searchQuery) {
               edges {
                 node {
@@ -120,19 +132,30 @@ async function handleCronJob(request) {
           }
         `,
         {
-          variables: { searchQuery: `tag:${tag}` },
+          variables: { searchQuery },
         }
       );
 
       const customersJson = await customersResponse.json();
-      const customers = customersJson.data?.customers?.edges?.map((e) => e.node) || [];
+      const rawCustomers = customersJson.data?.customers?.edges?.map((e) => e.node) || [];
+
+      // Filter in-memory to ensure customer tag strictly matches this product
+      const matchedCustomers = rawCustomers.filter((customer) => {
+        if (!customer.tags) return false;
+        return customer.tags.some(
+          (t) =>
+            t.includes(`notify_${product.handle}`) ||
+            t.includes(`notify_${cleanHandle}`) ||
+            (numericId && t.includes(`notify_${numericId}`))
+        );
+      });
 
       // --- 5. Dispatch Notification Emails ---
       const productUrl = `https://leapslair.com/products/${product.handle}`;
       let sentCount = 0;
-      const emailErrors = [];
+      const emailLogs = [];
 
-      for (const customer of customers) {
+      for (const customer of matchedCustomers) {
         if (!customer.email) continue;
         try {
           await sendNotifyEmail({
@@ -142,13 +165,14 @@ async function handleCronJob(request) {
             productUrl,
           });
           sentCount++;
+          emailLogs.push({ email: customer.email, status: "Sent" });
         } catch (err) {
-          console.error(`Email error for ${customer.email}:`, err);
-          emailErrors.push({ email: customer.email, error: err.message });
+          console.error(`Failed sending to ${customer.email}:`, err);
+          emailLogs.push({ email: customer.email, status: "Failed", error: err.message });
         }
       }
 
-      // --- 6. Mark product as notified (Only if at least attempted or processed) ---
+      // --- 6. Mark product as notified ---
       await admin.graphql(
         `#graphql
           mutation setNotified($metafields: [MetafieldsSetInput!]!) {
@@ -175,22 +199,21 @@ async function handleCronJob(request) {
       results.push({
         product: product.title,
         handle: product.handle,
-        matchedTag: tag,
-        customersFound: customers.length,
+        matchedQuery: searchQuery,
+        customersFound: matchedCustomers.length,
         emailsSent: sentCount,
-        emailErrors,
+        emailLogs,
       });
     }
 
     return Response.json({
       ok: true,
       shop: connectedDomain,
-      totalProductsWithDropDate: dropProducts.length,
-      processedLiveProducts: results.length,
+      totalDropProductsFound: dropProducts.length,
+      processedProductsCount: results.length,
       results,
       skippedDetails,
     });
-
   } catch (error) {
     console.error("Cron Error:", error);
     return Response.json(
@@ -209,11 +232,11 @@ export async function action({ request }) {
 }
 
 // -----------------------------------------------------------------------
-// Email Provider function
+// Email Provider Integration (Resend or Console Log)
 // -----------------------------------------------------------------------
 async function sendNotifyEmail({ to, firstName, productTitle, productUrl }) {
   if (!RESEND_API_KEY) {
-    console.log(`[STUB EMAIL] No RESEND_API_KEY set. Would send to: ${to} for "${productTitle}"`);
+    console.log(`[STUB EMAIL] No RESEND_API_KEY. Would email ${to} for "${productTitle}" | URL: ${productUrl}`);
     return;
   }
 
@@ -224,26 +247,26 @@ async function sendNotifyEmail({ to, firstName, productTitle, productUrl }) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: "LeapsLair <notifications@leapslair.com>", // ya testing ke liye "onboarding@resend.dev"
+      from: "LeapsLair <onboarding@resend.dev>", // Domain verify hone par: orders@leapslair.com
       to: [to],
       subject: `🚨 ${productTitle} is NOW LIVE!`,
       html: `
-        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <h2>Hey ${firstName || "Collector"},</h2>
-          <p>Great news! The drop you were waiting for, <strong>${productTitle}</strong>, is officially live now.</p>
+        <div style="font-family: Arial, sans-serif; max-width: 580px; margin: 0 auto; padding: 20px; line-height: 1.5;">
+          <h2>Hey ${firstName || "there"}!</h2>
+          <p>Great news! The drop you were waiting for, <strong>${productTitle}</strong>, is officially available for purchase.</p>
           <p style="margin: 25px 0;">
-            <a href="${productUrl}" style="background-color: #111; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">
-              Order Now Before It Sells Out &rarr;
+            <a href="${productUrl}" style="background-color: #000; color: #fff; padding: 12px 22px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">
+              View &amp; Buy Product &rarr;
             </a>
           </p>
-          <p style="color: #666; font-size: 13px;">If the button above does not work, visit: <br/>${productUrl}</p>
+          <p style="color: #777; font-size: 13px;">Or open this link directly: <br/><a href="${productUrl}">${productUrl}</a></p>
         </div>
       `,
     }),
   });
 
   if (!res.ok) {
-    const errBody = await res.text();
-    throw new Error(`Resend Error ${res.status}: ${errBody}`);
+    const errorText = await res.text();
+    throw new Error(`Resend Error: ${res.status} - ${errorText}`);
   }
 }
