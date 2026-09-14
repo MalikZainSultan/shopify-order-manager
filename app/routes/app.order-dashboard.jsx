@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useCallback } from "react";
+import React, { useMemo, useState, useCallback, useEffect } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import {
   Page,
@@ -19,6 +19,7 @@ import {
   EmptyState,
   Divider,
   Tooltip,
+  Pagination,
   AppProvider as PolarisProvider,
 } from "@shopify/polaris";
 import {
@@ -42,13 +43,13 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FETCHING (SAFE COST PAGINATION ENGINE)        */
+/*  1. UNLIMITED GRAPHQL FAST FETCHING (100 PER CALL, NO LIMIT)       */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
   query FetchAllStoreOrders($cursor: String) {
     orders(
-      first: 50
+      first: 100
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
@@ -114,6 +115,7 @@ async function fetchAllOrders(admin) {
   let cursor = null;
   let hasNextPage = true;
 
+  // Har single order ko safely bina kisi limit ke fetch karega
   while (hasNextPage) {
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
@@ -238,7 +240,7 @@ function processOrder(rawOrder, today) {
     const isCgc = isCgcItem(li);
     const isReturned = isCgcGradingReturned(rawOrder.tags, li.id);
 
-    // CGC Item jab tak return na ho wo grading queue ka hissa hai
+    // CGC Item tab tak grading status par rahega jab tak return na ho
     const isAtGrading = isCgc && !isReturned;
 
     let estimatedGradingReadyDate = null;
@@ -355,7 +357,7 @@ function groupByCustomer(orders) {
         worstAging: groupOrders.reduce((worst, o) => {
           const orderWorst = o.lineItems.reduce((w, li) => {
             if (li.agingStatus === "critical") return "critical";
-            if (li.agingStatus === "warning" && w !== "critical") return "warning";
+            if (li.agingStatus === "warning" && worst !== "critical") return "warning";
             return w;
           }, null);
           if (orderWorst === "critical") return "critical";
@@ -442,7 +444,7 @@ function processOrders(rawOrders) {
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
     if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
 
-    // CGC tab mein har wo order bhi show hona chahiye jisme koi unfulfilled CGC item grading par ho
+    // CGC tab check
     const hasPendingCgc = processed.lineItems.some((li) => li.isAtGrading && li.unfulfilledQuantity > 0);
     if (hasPendingCgc && processed.bucket !== "atGrading" && !processed.isCancelled && processed.hasUnfulfilled) {
       if (!buckets.atGrading.some((o) => o.id === processed.id)) {
@@ -520,6 +522,8 @@ const CHANNEL_OPTIONS = [
   { label: "eBay Marketplace", value: "ebay" },
   { label: "Whatnot Live", value: "whatnot" },
 ];
+
+const PAGE_SIZE = 100; // Ek page par 100 orders list honge
 
 function formatDate(dateString) {
   if (!dateString) return "—";
@@ -895,6 +899,14 @@ export default function FulfillmentDashboard() {
   const [channelFilter, setChannelFilter] = useState([]);
   const [queryValue, setQueryValue] = useState("");
   const [expandedGroups, setExpandedGroups] = useState(new Set());
+  
+  // PAGINATION STATE (100 Items Per Page)
+  const [currentPage, setCurrentPage] = useState(1);
+
+  // Tab change hone par ya search karne par page 1 par reset ho jaye
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [selectedTab, queryValue, channelFilter]);
 
   const onToggleGroup = useCallback((key) => {
     setExpandedGroups((prev) => {
@@ -923,6 +935,13 @@ export default function FulfillmentDashboard() {
     const byChannel = filterGroupsByChannel(base, channelFilter);
     return filterGroupsByQuery(byChannel, queryValue);
   }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue]);
+
+  // PAGINATED SLICE (100 PER VIEW)
+  const totalPages = Math.ceil(filteredGroups.length / PAGE_SIZE) || 1;
+  const paginatedGroups = useMemo(() => {
+    const start = (currentPage - 1) * PAGE_SIZE;
+    return filteredGroups.slice(start, start + PAGE_SIZE);
+  }, [filteredGroups, currentPage]);
 
   const filteredPullListItems = useMemo(() => {
     if (channelFilter.length === 0) return pullListItems;
@@ -1025,17 +1044,47 @@ export default function FulfillmentDashboard() {
                   )}
 
                   <Box paddingBlockStart="200">
-                    <Text as="h3" variant="headingSm" tone="subdued">
-                      Orders in Queue ({filteredGroups.length} Customer Blocks)
-                    </Text>
-                    <Box paddingBlockStart="200">
+                    <InlineStack align="space-between" blockAlign="center">
+                      <Text as="h3" variant="headingSm" tone="subdued">
+                        Orders in Queue ({filteredGroups.length} Total Customers) — Showing Page {currentPage} of {totalPages}
+                      </Text>
+                      {filteredGroups.length > PAGE_SIZE && (
+                        <Pagination
+                          hasPrevious={currentPage > 1}
+                          onPrevious={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                          hasNext={currentPage < totalPages}
+                          onNext={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                        />
+                      )}
+                    </InlineStack>
+
+                    <Box paddingBlockStart="300">
                       <BucketIndexTable
-                        groups={filteredGroups}
+                        groups={paginatedGroups}
                         bucketKey={activeBucketKey}
                         expandedGroups={expandedGroups}
                         onToggleGroup={onToggleGroup}
                       />
                     </Box>
+
+                    {filteredGroups.length > PAGE_SIZE && (
+                      <Box paddingBlockStart="400">
+                        <InlineStack align="center">
+                          <Pagination
+                            hasPrevious={currentPage > 1}
+                            onPrevious={() => {
+                              setCurrentPage((p) => Math.max(1, p - 1));
+                              window.scrollTo({ top: 0, behavior: 'smooth' });
+                            }}
+                            hasNext={currentPage < totalPages}
+                            onNext={() => {
+                              setCurrentPage((p) => Math.min(totalPages, p + 1));
+                              window.scrollTo({ top: 0, behavior: 'smooth' });
+                            }}
+                          />
+                        </InlineStack>
+                      </Box>
+                    )}
                   </Box>
                 </BlockStack>
               </Box>
