@@ -238,13 +238,15 @@ function processOrder(rawOrder, today) {
     const isCgc = isCgcItem(li);
     const isReturned = isCgcGradingReturned(rawOrder.tags, li.id);
 
-    const isAtGrading = isCgc && isReleased && !isReturned;
+    // CGC Item jab tak return na ho wo grading queue ka hissa hai
+    const isAtGrading = isCgc && !isReturned;
 
     let estimatedGradingReadyDate = null;
     let daysPastGradingEstimate = null;
 
-    if (isCgc && releaseDate) {
-      estimatedGradingReadyDate = addDays(releaseDate, 90);
+    if (isCgc) {
+      const baseDate = releaseDate || new Date(rawOrder.createdAt);
+      estimatedGradingReadyDate = addDays(baseDate, 90);
       if (today > estimatedGradingReadyDate && !isReturned) {
         daysPastGradingEstimate = daysBetween(today, estimatedGradingReadyDate);
       }
@@ -253,12 +255,12 @@ function processOrder(rawOrder, today) {
     let daysPastRelease = null;
     let agingStatus = null;
 
-    if (isReleased && releaseDate && li.unfulfilledQuantity > 0 && !isCancelled) {
+    if (li.unfulfilledQuantity > 0 && !isCancelled) {
       if (isAtGrading) {
         if (daysPastGradingEstimate && daysPastGradingEstimate > 0) {
           agingStatus = "critical";
         }
-      } else {
+      } else if (isReleased && releaseDate) {
         daysPastRelease = daysBetween(today, releaseDate);
         if (daysPastRelease >= 14) agingStatus = "critical";
         else if (daysPastRelease >= 7) agingStatus = "warning";
@@ -296,8 +298,8 @@ function processOrder(rawOrder, today) {
   } else {
     const activeItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
     const allAtGrading = activeItems.every((li) => li.isAtGrading);
-    const allPreOrder = activeItems.every((li) => !li.isReleased);
-    const allReadyToShip = activeItems.every((li) => li.isReleased && !li.isAtGrading);
+    const allPreOrder = activeItems.every((li) => !li.isReleased && !li.isAtGrading);
+    const allReadyToShip = activeItems.every((li) => (li.isReleased && !li.isAtGrading) || (li.isCgc && li.isGradingReturned));
 
     if (allReadyToShip) {
       bucket = "readyToShip";
@@ -374,7 +376,7 @@ function buildFocPullList(waitingOrders) {
 
   for (const order of waitingOrders) {
     for (const item of order.lineItems) {
-      if (item.unfulfilledQuantity > 0 && !item.isReleased) {
+      if (item.unfulfilledQuantity > 0 && !item.isReleased && !item.isAtGrading) {
         const focKey = item.focDate || "No FOC Date Assigned";
         if (!focMap.has(focKey)) {
           focMap.set(focKey, new Map());
@@ -439,6 +441,14 @@ function processOrders(rawOrders) {
 
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
     if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
+
+    // CGC tab mein har wo order bhi show hona chahiye jisme koi unfulfilled CGC item grading par ho
+    const hasPendingCgc = processed.lineItems.some((li) => li.isAtGrading && li.unfulfilledQuantity > 0);
+    if (hasPendingCgc && processed.bucket !== "atGrading" && !processed.isCancelled && processed.hasUnfulfilled) {
+      if (!buckets.atGrading.some((o) => o.id === processed.id)) {
+        buckets.atGrading.push(processed);
+      }
+    }
 
     if (processed.bucket === "partiallyReady") {
       processed.lineItems
@@ -642,7 +652,7 @@ function OrderSummaryRow({ order }) {
                   <Badge tone="critical">Voided</Badge>
                 ) : (
                   <>
-                    {!li.isReleased && <Badge tone="info">Pre-order</Badge>}
+                    {!li.isReleased && !li.isAtGrading && <Badge tone="info">Pre-order</Badge>}
                     {li.isAtGrading && <Badge tone="warning">At Grading (60-90d)</Badge>}
                     {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
                     {li.unfulfilledQuantity > 0 && li.isReleased && !li.isAtGrading && (
