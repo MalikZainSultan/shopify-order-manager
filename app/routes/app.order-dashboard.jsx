@@ -115,7 +115,6 @@ async function fetchAllOrders(admin) {
   let cursor = null;
   let hasNextPage = true;
 
-  // Har single order ko safely bina kisi limit ke fetch karega
   while (hasNextPage) {
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
@@ -205,9 +204,15 @@ function isCgcItem(item) {
   return title.includes("cgc") || sku.includes("cgc") || variantTitle.includes("cgc");
 }
 
-function isCgcGradingReturned(orderTags = [], lineItemId) {
+// Client Requirement: Order tab se tab hate jab appropriate tag lagayen ya fulfilled ho
+function hasCgcRemovalTag(orderTags = [], lineItemId = null) {
   const tags = Array.isArray(orderTags) ? orderTags.map((t) => t.toLowerCase().trim()) : [];
-  return tags.includes("cgc-returned") || tags.includes(`cgc-returned-${lineItemId}`.toLowerCase());
+  const validTags = ["cgc-returned", "cgc-processed", "cgc-done", "cgc-received"];
+  
+  if (tags.some((t) => validTags.includes(t))) return true;
+  if (lineItemId && tags.some((t) => t === `cgc-returned-${lineItemId}`.toLowerCase())) return true;
+  
+  return false;
 }
 
 function buildCustomerKey(order) {
@@ -231,6 +236,8 @@ function processOrder(rawOrder, today) {
     rawOrder.displayFulfillmentStatus === "FULFILLED" ||
     allRawItems.every((li) => li.unfulfilledQuantity === 0);
 
+  const orderHasCgcRemovalTag = hasCgcRemovalTag(rawOrder.tags);
+
   const lineItems = allRawItems.map((li) => {
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = releaseDateRaw ? new Date(releaseDateRaw) : null;
@@ -238,9 +245,9 @@ function processOrder(rawOrder, today) {
 
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
     const isCgc = isCgcItem(li);
-    const isReturned = isCgcGradingReturned(rawOrder.tags, li.id);
+    const isReturned = orderHasCgcRemovalTag || hasCgcRemovalTag(rawOrder.tags, li.id);
 
-    // CGC Item tab tak grading status par rahega jab tak return na ho
+    // CGC Item release date par depend nahi karta, placed hone ke baad se track hota hai
     const isAtGrading = isCgc && !isReturned;
 
     let estimatedGradingReadyDate = null;
@@ -291,6 +298,10 @@ function processOrder(rawOrder, today) {
   });
 
   const hasUnfulfilled = lineItems.some((li) => li.unfulfilledQuantity > 0) && !isCancelled;
+  const hasCgcItemInOrder = lineItems.some((li) => li.isCgc);
+
+  // Client Requirement: Any order containing CGC item stays until tag applied OR fulfilled
+  const cgcActiveInOrder = hasCgcItemInOrder && !orderHasCgcRemovalTag && !isFullyFulfilled && !isCancelled;
 
   let bucket;
   if (isCancelled) {
@@ -329,6 +340,7 @@ function processOrder(rawOrder, today) {
     bucket,
     hasUnfulfilled,
     isCancelled,
+    cgcActiveInOrder,
     customerKey: buildCustomerKey(rawOrder),
   };
 }
@@ -444,9 +456,10 @@ function processOrders(rawOrders) {
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
     if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
 
-    // CGC tab check
-    const hasPendingCgc = processed.lineItems.some((li) => li.isAtGrading && li.unfulfilledQuantity > 0);
-    if (hasPendingCgc && processed.bucket !== "atGrading" && !processed.isCancelled && processed.hasUnfulfilled) {
+    // EXACT CGC TAB LOGIC AS CLIENT REQUESTED:
+    // Any order containing CGC item MUST stay visible on CGC tab from placement
+    // until tag is applied OR it is marked fulfilled.
+    if (processed.cgcActiveInOrder) {
       if (!buckets.atGrading.some((o) => o.id === processed.id)) {
         buckets.atGrading.push(processed);
       }
@@ -523,7 +536,7 @@ const CHANNEL_OPTIONS = [
   { label: "Whatnot Live", value: "whatnot" },
 ];
 
-const PAGE_SIZE = 100; // Ek page par 100 orders list honge
+const PAGE_SIZE = 100;
 
 function formatDate(dateString) {
   if (!dateString) return "—";
@@ -900,10 +913,8 @@ export default function FulfillmentDashboard() {
   const [queryValue, setQueryValue] = useState("");
   const [expandedGroups, setExpandedGroups] = useState(new Set());
   
-  // PAGINATION STATE (100 Items Per Page)
   const [currentPage, setCurrentPage] = useState(1);
 
-  // Tab change hone par ya search karne par page 1 par reset ho jaye
   useEffect(() => {
     setCurrentPage(1);
   }, [selectedTab, queryValue, channelFilter]);
@@ -936,7 +947,6 @@ export default function FulfillmentDashboard() {
     return filterGroupsByQuery(byChannel, queryValue);
   }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue]);
 
-  // PAGINATED SLICE (100 PER VIEW)
   const totalPages = Math.ceil(filteredGroups.length / PAGE_SIZE) || 1;
   const paginatedGroups = useMemo(() => {
     const start = (currentPage - 1) * PAGE_SIZE;
@@ -1018,7 +1028,7 @@ export default function FulfillmentDashboard() {
                     <Banner tone="warning" icon={ClockIcon}>
                       <Text as="p" fontWeight="semibold">CGC Grading Processing Queue</Text>
                       <Text as="p">
-                        Items currently undergoing 60-90 day slab grading. Add tag <code>cgc-returned</code> to order to unlock to Ready to Ship.
+                        All orders containing CGC items are tracked here from placement until marked fulfilled or tagged with <code>cgc-returned</code> / <code>cgc-processed</code>.
                       </Text>
                     </Banner>
                   )}
