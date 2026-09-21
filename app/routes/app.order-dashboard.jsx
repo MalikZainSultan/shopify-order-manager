@@ -43,70 +43,17 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. DIRECT TARGET + GENERAL BATCH QUERY (NO SYNTAX ERRORS)         */
+/*  1. LAST 6 MONTHS FAST BULK INGESTION GRAPHQL QUERY                */
 /* ------------------------------------------------------------------ */
 
-const TARGET_ORDERS_QUERY = `#graphql
-  query FetchTargetSpecificOrders($queryString: String!) {
-    orders(first: 20, query: $queryString) {
-      edges {
-        node {
-          id
-          name
-          createdAt
-          cancelledAt
-          cancelReason
-          displayFulfillmentStatus
-          displayFinancialStatus
-          tags
-          customer {
-            firstName
-            lastName
-          }
-          email
-          shippingAddress {
-            name
-            address1
-            address2
-            city
-            zip
-            country
-          }
-          lineItems(first: 50) {
-            edges {
-              node {
-                id
-                title
-                variantTitle
-                sku
-                quantity
-                unfulfilledQuantity
-                product {
-                  id
-                  tags
-                  metafield(namespace: "custom", key: "release_date") {
-                    value
-                  }
-                  focMetafield: metafield(namespace: "custom", key: "foc_date") {
-                    value
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-`;
-
-const GENERAL_STORE_ORDERS_QUERY = `#graphql
-  query FetchAllStoreOrders($cursor: String) {
+const ORDERS_6_MONTHS_QUERY = `#graphql
+  query FetchSixMonthsOrders($cursor: String, $queryFilter: String!) {
     orders(
       first: 100
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
+      query: $queryFilter
     ) {
       pageInfo {
         hasNextPage
@@ -165,40 +112,28 @@ const GENERAL_STORE_ORDERS_QUERY = `#graphql
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function fetchAllStoreOrdersUnlimited(admin) {
+async function fetchLastSixMonthsOrders(admin) {
   const allOrders = [];
   const seenIds = new Set();
 
-  // STEP 1: Client ke un 5 orders ko exact name/number se guarantee fetch karein
-  try {
-    const targetQueryString = "4527 OR 5078 OR 5199 OR 5211 OR 5413";
-    const targetResponse = await admin.graphql(TARGET_ORDERS_QUERY, {
-      variables: { queryString: targetQueryString },
-    });
+  // Exact 6 Months Pehle Ki Date (ISO Format: YYYY-MM-DD)
+  const sixMonthsAgo = new Date();
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  const dateThreshold = sixMonthsAgo.toISOString().split("T")[0];
 
-    const targetPayload = await targetResponse.json();
-    const targetedEdges = targetPayload.data?.orders?.edges || [];
+  // Shopify GraphQL Standard Search Filter for 6 Months
+  const queryFilter = `created_at:>=${dateThreshold}`;
 
-    for (const edge of targetedEdges) {
-      if (!seenIds.has(edge.node.id)) {
-        seenIds.add(edge.node.id);
-        allOrders.push(edge.node);
-      }
-    }
-  } catch (err) {
-    console.error("Direct Target Fetch Error:", err);
-  }
-
-  // STEP 2: Baqi store orders bina kisi invalid syntax filter ke smoothly fetch karein
   let cursor = null;
   let hasNextPage = true;
   let batchCount = 0;
+  const maxBatches = 25; // 2,500 orders tak bina timeout ke fetch karega
 
-  while (hasNextPage && batchCount < 20) {
+  while (hasNextPage && batchCount < maxBatches) {
     batchCount++;
     try {
-      const response = await admin.graphql(GENERAL_STORE_ORDERS_QUERY, {
-        variables: { cursor },
+      const response = await admin.graphql(ORDERS_6_MONTHS_QUERY, {
+        variables: { cursor, queryFilter },
       });
 
       if (response.status === 429) {
@@ -219,11 +154,29 @@ async function fetchAllStoreOrdersUnlimited(admin) {
 
       hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
       cursor = ordersData.pageInfo?.endCursor || null;
-      await delay(60);
+      await delay(50);
     } catch (err) {
-      console.error("Bulk Orders Pipeline Error:", err);
+      console.error("6-Months Fetch Pipeline Error:", err);
       break;
     }
+  }
+
+  // Backup step: Client ke specifically mentioned 5 orders agar date filter se bahar hon toh bhi guaranteed add hon
+  try {
+    const targetQuery = "4527 OR 5078 OR 5199 OR 5211 OR 5413";
+    const backupRes = await admin.graphql(ORDERS_6_MONTHS_QUERY, {
+      variables: { cursor: null, queryFilter: targetQuery },
+    });
+    const backupPayload = await backupRes.json();
+    const backupEdges = backupPayload.data?.orders?.edges || [];
+    for (const edge of backupEdges) {
+      if (!seenIds.has(edge.node.id)) {
+        seenIds.add(edge.node.id);
+        allOrders.push(edge.node);
+      }
+    }
+  } catch (err) {
+    console.error("Backup Target Fetch Error:", err);
   }
 
   return allOrders;
@@ -348,7 +301,7 @@ function processOrder(rawOrder, today) {
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = parseSafeDate(releaseDateRaw);
 
-    // Agar release date na ho (ya eBay unlinked product ho) toh released maana jayega
+    // US timezone check: release date na hone par auto-released
     const isReleased = !releaseDate || releaseDate.getTime() <= today.getTime();
 
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
@@ -616,7 +569,7 @@ function processOrders(rawOrders) {
 
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
-  const rawOrders = await fetchAllStoreOrdersUnlimited(admin);
+  const rawOrders = await fetchLastSixMonthsOrders(admin);
   const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processOrders(rawOrders);
 
   return jsonResponse({
@@ -817,7 +770,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           heading="Queue Cleared / No Matching Results"
           image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
         >
-          <p>No matching order records found across the database query criteria.</p>
+          <p>No matching order records found in the last 6 months.</p>
         </EmptyState>
       </Box>
     );
@@ -1068,7 +1021,6 @@ export default function FulfillmentDashboard() {
     const byChannel = filterGroupsByChannel(base, channelFilter);
     const results = filterGroupsByQuery(byChannel, queryValue);
 
-    // Search ke doraan matching cards ko automatically open kar do
     if (isSearching) {
       setExpandedGroups(new Set(results.map((r) => r.key)));
     }
@@ -1104,7 +1056,7 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Active Ingestion: ${totalOrdersCount} Orders Managed`}
+        subtitle={`Metafield Synchronization Queue Engine • Active Ingestion: ${totalOrdersCount} Orders (Last 6 Months Range)`}
         primaryAction={{
           content: "Sync Orders Now",
           icon: RefreshIcon,
@@ -1148,7 +1100,7 @@ export default function FulfillmentDashboard() {
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
                       <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across all orders in database.
+                        Global Search Active: Showing results matching "{queryValue}" across all 6-months ingested orders.
                       </Text>
                     </Banner>
                   )}
