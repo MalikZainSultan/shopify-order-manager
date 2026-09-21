@@ -20,7 +20,6 @@ import {
   Divider,
   Tooltip,
   Pagination,
-  AppProvider as PolarisProvider,
 } from "@shopify/polaris";
 import {
   ChevronDownIcon,
@@ -43,13 +42,13 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED RECURSIVE STORE FETCHING (ALL ORDERS EVER CREATED)   */
+/*  1. UNLIMITED ROBUST RECURSIVE STORE FETCHING                      */
 /* ------------------------------------------------------------------ */
 
-const ALL_STORE_ORDERS_UNLIMITED_QUERY = `#graphql
-  query FetchEntireStoreOrders($cursor: String) {
+const ALL_STORE_ORDERS_QUERY = `#graphql
+  query FetchAllStoreOrders($cursor: String) {
     orders(
-      first: 250
+      first: 100
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
@@ -117,15 +116,14 @@ async function fetchAllStoreOrdersUnlimited(admin) {
   let cursor = null;
   let hasNextPage = true;
 
-  // Koi limit nahi: Jab tak database ka aakhri order fetch na ho jaye yeh chalta rahega
   while (hasNextPage) {
     try {
-      const response = await admin.graphql(ALL_STORE_ORDERS_UNLIMITED_QUERY, {
+      const response = await admin.graphql(ALL_STORE_ORDERS_QUERY, {
         variables: { cursor },
       });
 
       if (response.status === 429) {
-        await delay(2000);
+        await delay(1500);
         continue;
       }
 
@@ -136,7 +134,7 @@ async function fetchAllStoreOrdersUnlimited(admin) {
           (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
         );
         if (isThrottled) {
-          await delay(2000);
+          await delay(1500);
           continue;
         }
         break;
@@ -154,11 +152,9 @@ async function fetchAllStoreOrdersUnlimited(admin) {
 
       hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
       cursor = ordersData.pageInfo?.endCursor || null;
-
-      // Shopify API bucket limit ko safe rakhne ke liye micro pause
-      await delay(50);
+      await delay(40);
     } catch (err) {
-      console.error("Infinite Fetch Loop Exception:", err);
+      console.error("Fetch Loop Error:", err);
       break;
     }
   }
@@ -951,7 +947,13 @@ function FocPullListView({ focGroups }) {
 }
 
 export default function FulfillmentDashboard() {
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, fetchedAt, totalOrdersCount } = useLoaderData();
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, totalOrdersCount } = useLoaderData();
+
+  // Hydration Mismatch Guard to prevent Minified React Errors (#418, #425, #423)
+  const [isMounted, setIsMounted] = useState(false);
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const handleManualSync = () => {
@@ -1002,14 +1004,15 @@ export default function FulfillmentDashboard() {
     const isSearching = Boolean(queryValue.trim());
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
     const byChannel = filterGroupsByChannel(base, channelFilter);
-    const results = filterGroupsByQuery(byChannel, queryValue);
-
-    if (isSearching) {
-      setExpandedGroups(new Set(results.map((r) => r.key)));
-    }
-
-    return results;
+    return filterGroupsByQuery(byChannel, queryValue);
   }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue]);
+
+  // Auto-expand searched orders safely inside useEffect (No direct state mutation in useMemo)
+  useEffect(() => {
+    if (queryValue.trim()) {
+      setExpandedGroups(new Set(filteredGroups.map((r) => r.key)));
+    }
+  }, [queryValue, filteredGroups]);
 
   const totalPages = Math.ceil(filteredGroups.length / PAGE_SIZE) || 1;
   const paginatedGroups = useMemo(() => {
@@ -1028,225 +1031,222 @@ export default function FulfillmentDashboard() {
     onRemove: () => setChannelFilter([]),
   }] : [];
 
+  if (!isMounted) {
+    return (
+      <Page title="Loading Order Board...">
+        <Box padding="800">
+          <Text as="p" alignment="center">Synchronizing live order records...</Text>
+        </Box>
+      </Page>
+    );
+  }
+
   return (
-    <PolarisProvider i18n={{}}>
-      <style>{`
-        .Polaris-Page {
-          max-width: 100% !important;
-          margin: 0 auto;
-        }
-      `}</style>
+    <Page
+      title="Release Date Automated Dispatch Board"
+      subtitle={`Metafield Synchronization Queue Engine • Total Orders Ingested: ${totalOrdersCount}`}
+      primaryAction={{
+        content: "Sync Orders Now",
+        icon: RefreshIcon,
+        loading: isRefreshing,
+        onAction: handleManualSync,
+      }}
+    >
+      <Layout>
+        <Layout.Section>
+          <Card padding="0">
+            <Tabs
+              tabs={tabs.map((tab) => ({ id: tab.id, content: `${tab.content} (${tab.badgeCount})` }))}
+              selected={selectedTab}
+              onSelect={setSelectedTab}
+            />
+            <Box padding="400">
+              <BlockStack gap="400">
+                <Filters
+                  queryValue={queryValue}
+                  queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name across ALL tabs..."
+                  onQueryChange={setQueryValue}
+                  onQueryClear={() => setQueryValue("")}
+                  onClearAll={() => { setQueryValue(""); setChannelFilter([]); }}
+                  filters={[{
+                    key: "channel",
+                    label: "Marketplace Channels",
+                    filter: (
+                      <ChoiceList
+                        title="Sales channel"
+                        titleHidden
+                        choices={CHANNEL_OPTIONS}
+                        selected={channelFilter}
+                        onChange={setChannelFilter}
+                        allowMultiple
+                      />
+                    ),
+                  }]}
+                  appliedFilters={appliedFilters}
+                />
 
-      <Page
-        title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Total Orders in Store: ${totalOrdersCount}`}
-        primaryAction={{
-          content: "Sync Orders Now",
-          icon: RefreshIcon,
-          loading: isRefreshing,
-          onAction: handleManualSync,
-        }}
-      >
-        <Layout>
-          <Layout.Section>
-            <Card padding="0">
-              <Tabs
-                tabs={tabs.map((tab) => ({ id: tab.id, content: `${tab.content} (${tab.badgeCount})` }))}
-                selected={selectedTab}
-                onSelect={setSelectedTab}
-              />
-              <Box padding="400">
-                <BlockStack gap="400">
-                  <Filters
-                    queryValue={queryValue}
-                    queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name across ALL tabs..."
-                    onQueryChange={setQueryValue}
-                    onQueryClear={() => setQueryValue("")}
-                    onClearAll={() => { setQueryValue(""); setChannelFilter([]); }}
-                    filters={[{
-                      key: "channel",
-                      label: "Marketplace Channels",
-                      filter: (
-                        <ChoiceList
-                          title="Sales channel"
-                          titleHidden
-                          choices={CHANNEL_OPTIONS}
-                          selected={channelFilter}
-                          onChange={setChannelFilter}
-                          allowMultiple
-                        />
-                      ),
-                    }]}
-                    appliedFilters={appliedFilters}
-                  />
+                {queryValue.trim() && (
+                  <Banner tone="info" icon={SearchIcon}>
+                    <Text as="p" fontWeight="bold">
+                      Global Search Active: Showing results matching "{queryValue}" across all store records.
+                    </Text>
+                  </Banner>
+                )}
 
-                  {queryValue.trim() && (
-                    <Banner tone="info" icon={SearchIcon}>
-                      <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across all orders in store.
-                      </Text>
+                {activeBucketKey === "atGrading" && !queryValue.trim() && (
+                  <Banner tone="warning" icon={ClockIcon}>
+                    <Text as="p" fontWeight="semibold">CGC Grading Processing Queue</Text>
+                    <Text as="p">
+                      All orders containing CGC items are tracked here from placement until marked fulfilled or tagged with <code>cgc-returned</code> / <code>cgc-processed</code>.
+                    </Text>
+                  </Banner>
+                )}
+
+                {selectedTab === 3 && !queryValue.trim() && (
+                  <Banner tone="warning" icon={PackageIcon}>
+                    <Text as="p" fontWeight="semibold">Warehouse Extract / Harvest Pull List</Text>
+                    <Text as="p">Extract these line items from storage racks immediately. They are physically released but bound inside composite pre-order allocations.</Text>
+                    <Box paddingBlockStart="300">
+                      <PullListTable items={filteredPullListItems} />
+                    </Box>
+                  </Banner>
+                )}
+
+                {selectedTab === 4 && !queryValue.trim() && (
+                  <BlockStack gap="300">
+                    <Banner tone="info" icon={CalendarIcon}>
+                      <Text as="p" fontWeight="semibold">FOC Weekly Ordering Pull List</Text>
+                      <Text as="p">All unreleased items grouped by their FOC (Final Order Cutoff) deadline for vendor order placement.</Text>
                     </Banner>
-                  )}
+                    <FocPullListView focGroups={focPullList} />
+                  </BlockStack>
+                )}
 
-                  {activeBucketKey === "atGrading" && !queryValue.trim() && (
-                    <Banner tone="warning" icon={ClockIcon}>
-                      <Text as="p" fontWeight="semibold">CGC Grading Processing Queue</Text>
-                      <Text as="p">
-                        All orders containing CGC items are tracked here from placement until marked fulfilled or tagged with <code>cgc-returned</code> / <code>cgc-processed</code>.
-                      </Text>
-                    </Banner>
-                  )}
+                <Box paddingBlockStart="200">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <Text as="h3" variant="headingSm" tone="subdued">
+                      Orders in Queue ({filteredGroups.length} Total Customers) — Showing Page {currentPage} of {totalPages}
+                    </Text>
+                    {filteredGroups.length > PAGE_SIZE && (
+                      <Pagination
+                        hasPrevious={currentPage > 1}
+                        onPrevious={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                        hasNext={currentPage < totalPages}
+                        onNext={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                      />
+                    )}
+                  </InlineStack>
 
-                  {selectedTab === 3 && !queryValue.trim() && (
-                    <Banner tone="warning" icon={PackageIcon}>
-                      <Text as="p" fontWeight="semibold">Warehouse Extract / Harvest Pull List</Text>
-                      <Text as="p">Extract these line items from storage racks immediately. They are physically released but bound inside composite pre-order allocations.</Text>
-                      <Box paddingBlockStart="300">
-                        <PullListTable items={filteredPullListItems} />
-                      </Box>
-                    </Banner>
-                  )}
+                  <Box paddingBlockStart="300">
+                    <BucketIndexTable
+                      groups={paginatedGroups}
+                      bucketKey={activeBucketKey}
+                      expandedGroups={expandedGroups}
+                      onToggleGroup={onToggleGroup}
+                    />
+                  </Box>
 
-                  {selectedTab === 4 && !queryValue.trim() && (
-                    <BlockStack gap="300">
-                      <Banner tone="info" icon={CalendarIcon}>
-                        <Text as="p" fontWeight="semibold">FOC Weekly Ordering Pull List</Text>
-                        <Text as="p">All unreleased items grouped by their FOC (Final Order Cutoff) deadline for vendor order placement.</Text>
-                      </Banner>
-                      <FocPullListView focGroups={focPullList} />
-                    </BlockStack>
-                  )}
-
-                  <Box paddingBlockStart="200">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <Text as="h3" variant="headingSm" tone="subdued">
-                        Orders in Queue ({filteredGroups.length} Total Customers) — Showing Page {currentPage} of {totalPages}
-                      </Text>
-                      {filteredGroups.length > PAGE_SIZE && (
+                  {filteredGroups.length > PAGE_SIZE && (
+                    <Box paddingBlockStart="400">
+                      <InlineStack align="center">
                         <Pagination
                           hasPrevious={currentPage > 1}
-                          onPrevious={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                          onPrevious={() => {
+                            setCurrentPage((p) => Math.max(1, p - 1));
+                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                          }}
                           hasNext={currentPage < totalPages}
-                          onNext={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                          onNext={() => {
+                            setCurrentPage((p) => Math.min(totalPages, p + 1));
+                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                          }}
                         />
-                      )}
-                    </InlineStack>
-
-                    <Box paddingBlockStart="300">
-                      <BucketIndexTable
-                        groups={paginatedGroups}
-                        bucketKey={activeBucketKey}
-                        expandedGroups={expandedGroups}
-                        onToggleGroup={onToggleGroup}
-                      />
+                      </InlineStack>
                     </Box>
-
-                    {filteredGroups.length > PAGE_SIZE && (
-                      <Box paddingBlockStart="400">
-                        <InlineStack align="center">
-                          <Pagination
-                            hasPrevious={currentPage > 1}
-                            onPrevious={() => {
-                              setCurrentPage((p) => Math.max(1, p - 1));
-                              window.scrollTo({ top: 0, behavior: 'smooth' });
-                            }}
-                            hasNext={currentPage < totalPages}
-                            onNext={() => {
-                              setCurrentPage((p) => Math.min(totalPages, p + 1));
-                              window.scrollTo({ top: 0, behavior: 'smooth' });
-                            }}
-                          />
-                        </InlineStack>
-                      </Box>
-                    )}
-                  </Box>
-                </BlockStack>
-              </Box>
-            </Card>
-          </Layout.Section>
-
-          <Layout.Section variant="oneThird">
-            <Card>
-              <BlockStack gap="300">
-                <InlineStack gap="200" blockAlign="center">
-                  <Icon source={PackageIcon} tone="base" />
-                  <Text as="h3" fontWeight="semibold">Realtime Fulfillment Metrics</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="allUnfulfilled" />
-                  <Text as="span">{counts.allUnfulfilled} Total Pending</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="readyToShip" />
-                  <Text as="span">{counts.readyToShip} Orders Pending</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="atGrading" />
-                  <Text as="span">{counts.atGrading} Slabs at CGC</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="partiallyReady" />
-                  <Text as="span">{counts.partiallyReady} Hybrid Units</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="waitingOnRelease" />
-                  <Text as="span">{counts.waitingOnRelease} Vaulted Holds</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="completed" />
-                  <Text as="span">{counts.completed} Shipped Orders</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="cancelled" />
-                  <Text as="span">{counts.cancelled} Cancelled Orders</Text>
-                </InlineStack>
-                <Divider />
-                <Tooltip content="Live query architecture fetches directly from admin datastore.">
-                  <Text as="span" tone="subdued">Last Sync Cycle: {new Date(fetchedAt).toLocaleTimeString()}</Text>
-                </Tooltip>
-
-                {/* --- B2G1 AUTOMATION CONTROL SECTION --- */}
-                <Divider />
-                <BlockStack gap="200">
-                  <Text as="h4" variant="headingSm" fontWeight="semibold">
-                    Promotion Automation
-                  </Text>
-
-                  {b2g1Fetcher.data?.success && (
-                    <Banner tone="success">
-                      <Text as="p" variant="bodySm">
-                        Promotion synced! Updated {b2g1Fetcher.data.updatedCount ?? 0} eligible products.
-                      </Text>
-                    </Banner>
                   )}
-
-                  {b2g1Fetcher.data?.error && (
-                    <Banner tone="critical">
-                      <Text as="p" variant="bodySm">
-                        {b2g1Fetcher.data.error}
-                      </Text>
-                    </Banner>
-                  )}
-
-                  <Button
-                    icon={RefreshIcon}
-                    loading={isSyncingB2G1}
-                    onClick={handleSyncB2G1}
-                    fullWidth
-                  >
-                    Sync B2G1 Eligible Products
-                  </Button>
-                  <Text as="p" tone="subdued" variant="bodySm">
-                    Scans books older than 3 months (metafield: custom.release_date) and syncs eligible tags.
-                  </Text>
-                </BlockStack>
-                {/* --- END B2G1 CONTROL SECTION --- */}
-
+                </Box>
               </BlockStack>
-            </Card>
-          </Layout.Section>
-        </Layout>
-      </Page>
-    </PolarisProvider>
+            </Box>
+          </Card>
+        </Layout.Section>
+
+        <Layout.Section variant="oneThird">
+          <Card>
+            <BlockStack gap="300">
+              <InlineStack gap="200" blockAlign="center">
+                <Icon source={PackageIcon} tone="base" />
+                <Text as="h3" fontWeight="semibold">Realtime Fulfillment Metrics</Text>
+              </InlineStack>
+              <InlineStack align="space-between">
+                <BucketBadge bucketKey="allUnfulfilled" />
+                <Text as="span">{counts.allUnfulfilled} Total Pending</Text>
+              </InlineStack>
+              <InlineStack align="space-between">
+                <BucketBadge bucketKey="readyToShip" />
+                <Text as="span">{counts.readyToShip} Orders Pending</Text>
+              </InlineStack>
+              <InlineStack align="space-between">
+                <BucketBadge bucketKey="atGrading" />
+                <Text as="span">{counts.atGrading} Slabs at CGC</Text>
+              </InlineStack>
+              <InlineStack align="space-between">
+                <BucketBadge bucketKey="partiallyReady" />
+                <Text as="span">{counts.partiallyReady} Hybrid Units</Text>
+              </InlineStack>
+              <InlineStack align="space-between">
+                <BucketBadge bucketKey="waitingOnRelease" />
+                <Text as="span">{counts.waitingOnRelease} Vaulted Holds</Text>
+              </InlineStack>
+              <InlineStack align="space-between">
+                <BucketBadge bucketKey="completed" />
+                <Text as="span">{counts.completed} Shipped Orders</Text>
+              </InlineStack>
+              <InlineStack align="space-between">
+                <BucketBadge bucketKey="cancelled" />
+                <Text as="span">{counts.cancelled} Cancelled Orders</Text>
+              </InlineStack>
+
+              {/* --- B2G1 AUTOMATION CONTROL SECTION --- */}
+              <Divider />
+              <BlockStack gap="200">
+                <Text as="h4" variant="headingSm" fontWeight="semibold">
+                  Promotion Automation
+                </Text>
+
+                {b2g1Fetcher.data?.success && (
+                  <Banner tone="success">
+                    <Text as="p" variant="bodySm">
+                      Promotion synced! Updated {b2g1Fetcher.data.updatedCount ?? 0} eligible products.
+                    </Text>
+                  </Banner>
+                )}
+
+                {b2g1Fetcher.data?.error && (
+                  <Banner tone="critical">
+                    <Text as="p" variant="bodySm">
+                      {b2g1Fetcher.data.error}
+                    </Text>
+                  </Banner>
+                )}
+
+                <Button
+                  icon={RefreshIcon}
+                  loading={isSyncingB2G1}
+                  onClick={handleSyncB2G1}
+                  fullWidth
+                >
+                  Sync B2G1 Eligible Products
+                </Button>
+                <Text as="p" tone="subdued" variant="bodySm">
+                  Scans books older than 3 months (metafield: custom.release_date) and syncs eligible tags.
+                </Text>
+              </BlockStack>
+              {/* --- END B2G1 CONTROL SECTION --- */}
+
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+      </Layout>
+    </Page>
   );
 }
