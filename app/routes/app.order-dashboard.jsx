@@ -43,12 +43,22 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. ONLY TARGET 5 ORDERS FETCHING (DIRECT GRAPHQL QUERY)           */
+/*  1. BULK GRAPHQL FETCHING (BOTH ACTIVE & FULFILLED ORDERS)         */
 /* ------------------------------------------------------------------ */
 
-const DIRECT_TARGET_ORDERS_QUERY = `#graphql
-  query FetchOnlyFiveOrders($queryStr: String!) {
-    orders(first: 20, query: $queryStr) {
+const ORDERS_BATCH_QUERY = `#graphql
+  query FetchOrdersBatch($cursor: String, $queryStr: String) {
+    orders(
+      first: 100
+      after: $cursor
+      sortKey: CREATED_AT
+      reverse: true
+      query: $queryStr
+    ) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
       edges {
         node {
           id
@@ -100,36 +110,56 @@ const DIRECT_TARGET_ORDERS_QUERY = `#graphql
   }
 `;
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function fetchAllStoreOrdersUnlimited(admin) {
   const allOrders = [];
   const seenIds = new Set();
 
-  // Sirf Jim ke bataye hue 5 orders ki queries
-  const targetQueries = [
-    "name:#4527 OR name:#5078 OR name:#5199 OR name:#5211 OR name:#5413",
-    "name:4527 OR name:5078 OR name:5199 OR name:5211 OR name:5413",
-    "4527 OR 5078 OR 5199 OR 5211 OR 5413"
-  ];
+  // Helper function to safely fetch orders in batches
+  async function fetchBatches(queryFilter, maxBatches) {
+    let cursor = null;
+    let hasNextPage = true;
+    let count = 0;
 
-  for (const q of targetQueries) {
-    try {
-      const response = await admin.graphql(DIRECT_TARGET_ORDERS_QUERY, {
-        variables: { queryStr: q },
-      });
+    while (hasNextPage && count < maxBatches) {
+      count++;
+      try {
+        const response = await admin.graphql(ORDERS_BATCH_QUERY, {
+          variables: { cursor, queryStr: queryFilter },
+        });
 
-      const payload = await response.json();
-      const edges = payload.data?.orders?.edges || [];
-
-      for (const edge of edges) {
-        if (!seenIds.has(edge.node.id)) {
-          seenIds.add(edge.node.id);
-          allOrders.push(edge.node);
+        if (response.status === 429) {
+          await delay(1200);
+          continue;
         }
+
+        const payload = await response.json();
+        const ordersData = payload.data?.orders;
+        if (!ordersData?.edges || ordersData.edges.length === 0) break;
+
+        for (const edge of ordersData.edges) {
+          if (!seenIds.has(edge.node.id)) {
+            seenIds.add(edge.node.id);
+            allOrders.push(edge.node);
+          }
+        }
+
+        hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
+        cursor = ordersData.pageInfo?.endCursor || null;
+        await delay(60);
+      } catch (err) {
+        console.error("Batch Fetch Exception:", err);
+        break;
       }
-    } catch (err) {
-      console.error("Direct 5 Orders Fetch Error:", err);
     }
   }
+
+  // STEP 1: Pehle Tamam Open & Unfulfilled Orders fetch karein (Active Queue)
+  await fetchBatches("fulfillment_status:unfulfilled OR fulfillment_status:partial OR status:open", 15);
+
+  // STEP 2: Ab Fulfilled & Completed Orders fetch karein (Ismein client ke #4527, #5078, etc. aayenge)
+  await fetchBatches("fulfillment_status:fulfilled OR status:closed", 15);
 
   return allOrders;
 }
@@ -316,7 +346,7 @@ function processOrder(rawOrder, today) {
   if (isCancelled) {
     bucket = "cancelled";
   } else if (isFullyFulfilled) {
-    bucket = "completed";
+    bucket = "completed"; // Yahan Jim ke 5 fulfilled orders aayenge
   } else {
     const activeItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
     const allAtGrading = activeItems.length > 0 && activeItems.every((li) => li.isAtGrading);
@@ -697,7 +727,7 @@ function OrderSummaryRow({ order }) {
                   <>
                     {!li.isReleased && !li.isAtGrading && <Badge tone="info">Pre-order</Badge>}
                     {li.isAtGrading && <Badge tone="warning">At Grading (60-90d)</Badge>}
-                    {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped</Badge>}
+                    {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped / Fulfilled</Badge>}
                     {li.unfulfilledQuantity > 0 && li.isReleased && !li.isAtGrading && (
                       <Badge tone="attention">Pending Pickup</Badge>
                     )}
@@ -968,6 +998,7 @@ export default function FulfillmentDashboard() {
 
   const filteredGroups = useMemo(() => {
     const isSearching = Boolean(queryValue.trim());
+    // Global Search across ALL orders if searching, else show active tab
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
     const byChannel = filterGroupsByChannel(base, channelFilter);
     const results = filterGroupsByQuery(byChannel, queryValue);
@@ -1007,7 +1038,7 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Direct Mode: ${totalOrdersCount} Targeted Orders Loaded`}
+        subtitle={`Metafield Synchronization Queue Engine • Active Ingestion: ${totalOrdersCount} Orders Active`}
         primaryAction={{
           content: "Sync Orders Now",
           icon: RefreshIcon,
@@ -1051,7 +1082,7 @@ export default function FulfillmentDashboard() {
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
                       <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across all direct orders.
+                        Global Search Active: Showing results matching "{queryValue}" across all categories (including Completed & Shipped).
                       </Text>
                     </Banner>
                   )}
