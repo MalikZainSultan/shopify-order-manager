@@ -43,17 +43,17 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FAST FETCHING (SAFE PAGINATION)              */
+/*  1. UNLIMITED ROBUST FETCHING (ALL HISTORICAL ORDERS - 5+ YEARS)   */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
-  query FetchAllStoreOrders($cursor: String) {
+  query FetchAllStoreOrders($cursor: String, $queryStr: String) {
     orders(
       first: 100
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
-      query: "status:any"
+      query: $queryStr
     ) {
       pageInfo {
         hasNextPage
@@ -110,29 +110,43 @@ const ALL_ORDERS_QUERY = `#graphql
   }
 `;
 
-async function fetchAllOrders(admin) {
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function fetchAllStoreOrdersUnlimited(admin, queryStr = "status:any") {
   const allOrders = [];
   let cursor = null;
   let hasNextPage = true;
-  let attempts = 0;
-  const maxPages = 100; // 10,000 orders tak safe limit
 
-  while (hasNextPage && attempts < maxPages) {
-    attempts++;
+  while (hasNextPage) {
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
-        variables: { cursor },
+        variables: { cursor, queryStr },
       });
+
+      // Agar Shopify API Throttling (Rate Limit) trigger ho toh wait karein
+      if (response.status === 429) {
+        console.warn("Shopify Rate Limit hit, waiting 2 seconds before retry...");
+        await delay(2000);
+        continue;
+      }
 
       const payload = await response.json();
 
       if (payload.errors) {
-        console.error("Shopify GraphQL Error:", payload.errors);
+        console.error("Shopify GraphQL Errors:", payload.errors);
+        // Throttle check in error payload
+        const isThrottled = payload.errors.some(
+          (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
+        );
+        if (isThrottled) {
+          await delay(2000);
+          continue;
+        }
         break;
       }
 
       const ordersData = payload.data?.orders;
-      if (!ordersData?.edges) {
+      if (!ordersData?.edges || ordersData.edges.length === 0) {
         break;
       }
 
@@ -141,8 +155,12 @@ async function fetchAllOrders(admin) {
 
       hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
       cursor = ordersData.pageInfo?.endCursor || null;
+
+      // Safe micro-pause to prevent API bucket exhaustion across thousands of records
+      await delay(120);
     } catch (err) {
-      console.error("Pipeline Fetch Error:", err);
+      console.error("Pipeline Fetch Exception:", err);
+      await delay(1000);
       break;
     }
   }
@@ -156,7 +174,7 @@ async function fetchAllOrders(admin) {
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
-// USA Eastern Standard/Daylight Time ke mutabiq start of day calculate karna
+// Store Timezone Sync (US Eastern Standard / Daylight)
 function startOfTodayInUS(timeZone = "America/New_York") {
   const now = new Date();
   const formatter = new Intl.DateTimeFormat("en-US", {
@@ -173,16 +191,18 @@ function startOfTodayInUS(timeZone = "America/New_York") {
   return new Date(Number(yyyy), Number(mm) - 1, Number(dd), 0, 0, 0, 0);
 }
 
-// Metafield date parsing without unwanted UTC offset shifts
+// Robust Multi-format Date Parser (Timezone shift proof)
 function parseSafeDate(dateStr) {
   if (!dateStr || typeof dateStr !== "string") return null;
   const cleanStr = dateStr.trim();
-  
+
+  // Format: YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(cleanStr)) {
     const [y, m, d] = cleanStr.split("-").map(Number);
     return new Date(y, m - 1, d, 0, 0, 0, 0);
   }
 
+  // Format: MM/DD/YYYY
   if (/^\d{2}\/\d{2}\/\d{4}$/.test(cleanStr)) {
     const [m, d, y] = cleanStr.split("/").map(Number);
     return new Date(y, m - 1, d, 0, 0, 0, 0);
@@ -240,10 +260,10 @@ function isCgcItem(item) {
 function hasCgcRemovalTag(orderTags = [], lineItemId = null) {
   const tags = Array.isArray(orderTags) ? orderTags.map((t) => (t || "").toLowerCase().trim()) : [];
   const validTags = ["cgc-returned", "cgc-processed", "cgc-done", "cgc-received"];
-  
+
   if (tags.some((t) => validTags.includes(t))) return true;
   if (lineItemId && tags.some((t) => t === `cgc-returned-${lineItemId}`.toLowerCase())) return true;
-  
+
   return false;
 }
 
@@ -273,8 +293,8 @@ function processOrder(rawOrder, today) {
   const lineItems = allRawItems.map((li) => {
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = parseSafeDate(releaseDateRaw);
-    
-    // SAFE RELEASE CHECK: Agar release date nahi hai ya date guzar chuki hai (US Time) toh released maano
+
+    // Agar release date na ho ya guzar chuki ho (US Eastern Time), tab Released consider hoga
     const isReleased = !releaseDate || releaseDate.getTime() <= today.getTime();
 
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
@@ -487,7 +507,7 @@ function processOrders(rawOrders) {
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
     if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
 
-    // CGC Visibility Requirement
+    // CGC Visibility Constraint
     if (processed.cgcActiveInOrder) {
       if (!buckets.atGrading.some((o) => o.id === processed.id)) {
         buckets.atGrading.push(processed);
@@ -541,7 +561,7 @@ function processOrders(rawOrders) {
 
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
-  const rawOrders = await fetchAllOrders(admin);
+  const rawOrders = await fetchAllStoreOrdersUnlimited(admin, "status:any");
   const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processOrders(rawOrders);
 
   return jsonResponse({
@@ -639,15 +659,32 @@ function filterGroupsByChannel(groups, selectedChannels) {
     .filter(Boolean);
 }
 
+// Global Clean Search: Handles '#5078', '5078', Customer Name or Email smoothly
 function filterGroupsByQuery(groups, query) {
   if (!query) return groups;
-  const q = query.trim().toLowerCase();
+  const rawQ = query.trim().toLowerCase();
+  const cleanQ = rawQ.replace(/^#+/, "").trim(); // Remove leading '#'
+  const pureDigitsOnly = cleanQ.replace(/\D/g, ""); // Extract numbers only if searching order numbers
+
   return groups.filter((group) => {
-    return (
-      group.customerName.toLowerCase().includes(q) ||
-      group.customerEmail.toLowerCase().includes(q) ||
-      group.orders.some((o) => o.name.toLowerCase().includes(q))
-    );
+    const custName = group.customerName.toLowerCase();
+    const custEmail = group.customerEmail.toLowerCase();
+
+    const matchesCustomer = custName.includes(rawQ) || custName.includes(cleanQ) || custEmail.includes(cleanQ);
+
+    const matchesOrder = group.orders.some((o) => {
+      const orderName = (o.name || "").toLowerCase();
+      const orderCleanName = orderName.replace(/^#+/, "").trim();
+      const orderDigits = orderName.replace(/\D/g, "");
+
+      return (
+        orderName.includes(rawQ) ||
+        orderCleanName.includes(cleanQ) ||
+        (pureDigitsOnly.length >= 3 && orderDigits.includes(pureDigitsOnly))
+      );
+    });
+
+    return matchesCustomer || matchesOrder;
   });
 }
 
@@ -726,7 +763,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           heading="Queue Cleared / No Matching Results"
           image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
         >
-          <p>No matching order records found across the database query criteria.</p>
+          <p>No matching order records found across the store database.</p>
         </EmptyState>
       </Box>
     );
@@ -943,7 +980,7 @@ export default function FulfillmentDashboard() {
   const [channelFilter, setChannelFilter] = useState([]);
   const [queryValue, setQueryValue] = useState("");
   const [expandedGroups, setExpandedGroups] = useState(new Set());
-  
+
   const [currentPage, setCurrentPage] = useState(1);
 
   useEffect(() => {
@@ -971,6 +1008,7 @@ export default function FulfillmentDashboard() {
 
   const activeBucketKey = tabs[selectedTab].bucketKey;
 
+  // SEARCH ACROSS ALL ORDERS REGARDLESS OF TAB OR DATE
   const filteredGroups = useMemo(() => {
     const isSearching = Boolean(queryValue.trim());
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
@@ -1006,7 +1044,7 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Total Store Ingestion: ${totalOrdersCount} Orders Active`}
+        subtitle={`Metafield Synchronization Queue Engine • Total Store Ingestion: ${totalOrdersCount} Orders Active (Historical Sync)`}
         primaryAction={{
           content: "Sync Orders Now",
           icon: RefreshIcon,
@@ -1026,7 +1064,7 @@ export default function FulfillmentDashboard() {
                 <BlockStack gap="400">
                   <Filters
                     queryValue={queryValue}
-                    queryPlaceholder="Global Search: Type Order # or Customer Name across ALL tabs..."
+                    queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name across ALL tabs & history..."
                     onQueryChange={setQueryValue}
                     onQueryClear={() => setQueryValue("")}
                     onClearAll={() => { setQueryValue(""); setChannelFilter([]); }}
@@ -1050,7 +1088,7 @@ export default function FulfillmentDashboard() {
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
                       <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across ALL tabs and status categories.
+                        Global Search Active: Showing results matching "{queryValue}" across all historical orders and status categories.
                       </Text>
                     </Banner>
                   )}
@@ -1178,7 +1216,7 @@ export default function FulfillmentDashboard() {
                   <Text as="h4" variant="headingSm" fontWeight="semibold">
                     Promotion Automation
                   </Text>
-                  
+
                   {b2g1Fetcher.data?.success && (
                     <Banner tone="success">
                       <Text as="p" variant="bodySm">
