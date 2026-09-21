@@ -43,7 +43,7 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED GRAPHQL FAST FETCHING (100 PER CALL, NO LIMIT)       */
+/*  1. UNLIMITED GRAPHQL FAST FETCHING (SAFE PAGINATION)              */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
@@ -82,7 +82,7 @@ const ALL_ORDERS_QUERY = `#graphql
             zip
             country
           }
-          lineItems(first: 20) {
+          lineItems(first: 50) {
             edges {
               node {
                 id
@@ -114,8 +114,11 @@ async function fetchAllOrders(admin) {
   const allOrders = [];
   let cursor = null;
   let hasNextPage = true;
+  let attempts = 0;
+  const maxPages = 100; // 10,000 orders tak safe limit
 
-  while (hasNextPage) {
+  while (hasNextPage && attempts < maxPages) {
+    attempts++;
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
         variables: { cursor },
@@ -148,15 +151,45 @@ async function fetchAllOrders(admin) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  2. DATA PROCESSING & GROUPING RUNTIME                             */
+/*  2. US TIMEZONE & DATA PROCESSING ENGINE                           */
 /* ------------------------------------------------------------------ */
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
-function startOfToday() {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d;
+// USA Eastern Standard/Daylight Time ke mutabiq start of day calculate karna
+function startOfTodayInUS(timeZone = "America/New_York") {
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = formatter.formatToParts(now);
+  const mm = parts.find((p) => p.type === "month")?.value;
+  const dd = parts.find((p) => p.type === "day")?.value;
+  const yyyy = parts.find((p) => p.type === "year")?.value;
+
+  return new Date(Number(yyyy), Number(mm) - 1, Number(dd), 0, 0, 0, 0);
+}
+
+// Metafield date parsing without unwanted UTC offset shifts
+function parseSafeDate(dateStr) {
+  if (!dateStr || typeof dateStr !== "string") return null;
+  const cleanStr = dateStr.trim();
+  
+  if (/^\d{4}-\d{2}-\d{2}$/.test(cleanStr)) {
+    const [y, m, d] = cleanStr.split("-").map(Number);
+    return new Date(y, m - 1, d, 0, 0, 0, 0);
+  }
+
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(cleanStr)) {
+    const [m, d, y] = cleanStr.split("/").map(Number);
+    return new Date(y, m - 1, d, 0, 0, 0, 0);
+  }
+
+  const parsed = new Date(cleanStr);
+  return isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function daysBetween(later, earlier) {
@@ -172,7 +205,7 @@ function addDays(date, days) {
 function extractFocDate(productTags = [], productFocMetafield = null) {
   if (productFocMetafield) return productFocMetafield;
   const tagList = Array.isArray(productTags) ? productTags : [];
-  const focTag = tagList.find((t) => t.toLowerCase().startsWith("foc-"));
+  const focTag = tagList.find((t) => t && t.toLowerCase().startsWith("foc-"));
   if (focTag) {
     const rawDate = focTag.substring(4).trim();
     if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
@@ -204,9 +237,8 @@ function isCgcItem(item) {
   return title.includes("cgc") || sku.includes("cgc") || variantTitle.includes("cgc");
 }
 
-// Client Requirement: Order tab se tab hate jab appropriate tag lagayen ya fulfilled ho
 function hasCgcRemovalTag(orderTags = [], lineItemId = null) {
-  const tags = Array.isArray(orderTags) ? orderTags.map((t) => t.toLowerCase().trim()) : [];
+  const tags = Array.isArray(orderTags) ? orderTags.map((t) => (t || "").toLowerCase().trim()) : [];
   const validTags = ["cgc-returned", "cgc-processed", "cgc-done", "cgc-received"];
   
   if (tags.some((t) => validTags.includes(t))) return true;
@@ -240,14 +272,15 @@ function processOrder(rawOrder, today) {
 
   const lineItems = allRawItems.map((li) => {
     const releaseDateRaw = li.product?.metafield?.value || null;
-    const releaseDate = releaseDateRaw ? new Date(releaseDateRaw) : null;
-    const isReleased = !releaseDate || releaseDate <= today;
+    const releaseDate = parseSafeDate(releaseDateRaw);
+    
+    // SAFE RELEASE CHECK: Agar release date nahi hai ya date guzar chuki hai (US Time) toh released maano
+    const isReleased = !releaseDate || releaseDate.getTime() <= today.getTime();
 
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
     const isCgc = isCgcItem(li);
     const isReturned = orderHasCgcRemovalTag || hasCgcRemovalTag(rawOrder.tags, li.id);
 
-    // CGC Item release date par depend nahi karta, placed hone ke baad se track hota hai
     const isAtGrading = isCgc && !isReturned;
 
     let estimatedGradingReadyDate = null;
@@ -256,7 +289,7 @@ function processOrder(rawOrder, today) {
     if (isCgc) {
       const baseDate = releaseDate || new Date(rawOrder.createdAt);
       estimatedGradingReadyDate = addDays(baseDate, 90);
-      if (today > estimatedGradingReadyDate && !isReturned) {
+      if (today.getTime() > estimatedGradingReadyDate.getTime() && !isReturned) {
         daysPastGradingEstimate = daysBetween(today, estimatedGradingReadyDate);
       }
     }
@@ -299,8 +332,6 @@ function processOrder(rawOrder, today) {
 
   const hasUnfulfilled = lineItems.some((li) => li.unfulfilledQuantity > 0) && !isCancelled;
   const hasCgcItemInOrder = lineItems.some((li) => li.isCgc);
-
-  // Client Requirement: Any order containing CGC item stays until tag applied OR fulfilled
   const cgcActiveInOrder = hasCgcItemInOrder && !orderHasCgcRemovalTag && !isFullyFulfilled && !isCancelled;
 
   let bucket;
@@ -310,9 +341,9 @@ function processOrder(rawOrder, today) {
     bucket = "completed";
   } else {
     const activeItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
-    const allAtGrading = activeItems.every((li) => li.isAtGrading);
-    const allPreOrder = activeItems.every((li) => !li.isReleased && !li.isAtGrading);
-    const allReadyToShip = activeItems.every((li) => (li.isReleased && !li.isAtGrading) || (li.isCgc && li.isGradingReturned));
+    const allAtGrading = activeItems.length > 0 && activeItems.every((li) => li.isAtGrading);
+    const allPreOrder = activeItems.length > 0 && activeItems.every((li) => !li.isReleased && !li.isAtGrading);
+    const allReadyToShip = activeItems.length > 0 && activeItems.every((li) => (li.isReleased && !li.isAtGrading) || (li.isCgc && li.isGradingReturned));
 
     if (allReadyToShip) {
       bucket = "readyToShip";
@@ -434,7 +465,7 @@ function buildFocPullList(waitingOrders) {
 }
 
 function processOrders(rawOrders) {
-  const today = startOfToday();
+  const today = startOfTodayInUS();
   const buckets = {
     allUnfulfilled: [],
     readyToShip: [],
@@ -456,9 +487,7 @@ function processOrders(rawOrders) {
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
     if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
 
-    // EXACT CGC TAB LOGIC AS CLIENT REQUESTED:
-    // Any order containing CGC item MUST stay visible on CGC tab from placement
-    // until tag is applied OR it is marked fulfilled.
+    // CGC Visibility Requirement
     if (processed.cgcActiveInOrder) {
       if (!buckets.atGrading.some((o) => o.id === processed.id)) {
         buckets.atGrading.push(processed);
@@ -540,7 +569,9 @@ const PAGE_SIZE = 100;
 
 function formatDate(dateString) {
   if (!dateString) return "—";
-  return new Date(dateString).toLocaleDateString(undefined, {
+  const d = parseSafeDate(dateString);
+  if (!d) return "—";
+  return d.toLocaleDateString("en-US", {
     year: "numeric",
     month: "short",
     day: "numeric",
