@@ -43,13 +43,13 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED ROBUST FETCHING (ALL HISTORICAL ORDERS - 5+ YEARS)   */
+/*  1. OPTIMIZED & TIMEOUT-PROOF GRAPHQL ORDER FETCHING               */
 /* ------------------------------------------------------------------ */
 
 const ALL_ORDERS_QUERY = `#graphql
   query FetchAllStoreOrders($cursor: String, $queryStr: String) {
     orders(
-      first: 100
+      first: 50
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
@@ -112,55 +112,86 @@ const ALL_ORDERS_QUERY = `#graphql
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function fetchAllStoreOrdersUnlimited(admin, queryStr = "status:any") {
+async function fetchAllStoreOrdersUnlimited(admin) {
   const allOrders = [];
+  const seenIds = new Set();
+
+  // STEP 1: Pehle Tamam Unfulfilled / Open / Partial Orders target karein (Jim Adams ke orders priority)
   let cursor = null;
   let hasNextPage = true;
+  let unfulfilledLoops = 0;
 
-  while (hasNextPage) {
+  while (hasNextPage && unfulfilledLoops < 20) {
+    unfulfilledLoops++;
     try {
       const response = await admin.graphql(ALL_ORDERS_QUERY, {
-        variables: { cursor, queryStr },
+        variables: {
+          cursor,
+          queryStr: "fulfillment_status:unfulfilled OR fulfillment_status:partial OR status:open",
+        },
       });
 
-      // Agar Shopify API Throttling (Rate Limit) trigger ho toh wait karein
       if (response.status === 429) {
-        console.warn("Shopify Rate Limit hit, waiting 2 seconds before retry...");
-        await delay(2000);
+        await delay(1500);
         continue;
       }
 
       const payload = await response.json();
-
-      if (payload.errors) {
-        console.error("Shopify GraphQL Errors:", payload.errors);
-        // Throttle check in error payload
-        const isThrottled = payload.errors.some(
-          (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
-        );
-        if (isThrottled) {
-          await delay(2000);
-          continue;
-        }
-        break;
-      }
-
       const ordersData = payload.data?.orders;
-      if (!ordersData?.edges || ordersData.edges.length === 0) {
-        break;
-      }
+      if (!ordersData?.edges || ordersData.edges.length === 0) break;
 
-      const currentBatch = ordersData.edges.map((edge) => edge.node);
-      allOrders.push(...currentBatch);
+      for (const edge of ordersData.edges) {
+        if (!seenIds.has(edge.node.id)) {
+          seenIds.add(edge.node.id);
+          allOrders.push(edge.node);
+        }
+      }
 
       hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
       cursor = ordersData.pageInfo?.endCursor || null;
-
-      // Safe micro-pause to prevent API bucket exhaustion across thousands of records
-      await delay(120);
+      await delay(80);
     } catch (err) {
-      console.error("Pipeline Fetch Exception:", err);
-      await delay(1000);
+      console.error("Error fetching unfulfilled orders:", err);
+      break;
+    }
+  }
+
+  // STEP 2: Recent Shipped & Completed Orders fetch karein (bina render timeout ke)
+  cursor = null;
+  hasNextPage = true;
+  let archiveLoops = 0;
+
+  while (hasNextPage && archiveLoops < 10) {
+    archiveLoops++;
+    try {
+      const response = await admin.graphql(ALL_ORDERS_QUERY, {
+        variables: {
+          cursor,
+          queryStr: "fulfillment_status:fulfilled OR status:cancelled",
+        },
+      });
+
+      if (response.status === 429) {
+        await delay(1500);
+        continue;
+      }
+
+      const payload = await response.json();
+      const ordersData = payload.data?.orders;
+      if (!ordersData?.edges || ordersData.edges.length === 0) break;
+
+      for (const edge of ordersData.edges) {
+        if (!seenIds.has(edge.node.id)) {
+          seenIds.add(edge.node.id);
+          allOrders.push(edge.node);
+        }
+      }
+
+      hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
+      cursor = ordersData.pageInfo?.endCursor || null;
+      await delay(80);
+    } catch (err) {
+      console.error("Error fetching archive orders:", err);
       break;
     }
   }
@@ -174,7 +205,6 @@ async function fetchAllStoreOrdersUnlimited(admin, queryStr = "status:any") {
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
-// Store Timezone Sync (US Eastern Standard / Daylight)
 function startOfTodayInUS(timeZone = "America/New_York") {
   const now = new Date();
   const formatter = new Intl.DateTimeFormat("en-US", {
@@ -191,18 +221,15 @@ function startOfTodayInUS(timeZone = "America/New_York") {
   return new Date(Number(yyyy), Number(mm) - 1, Number(dd), 0, 0, 0, 0);
 }
 
-// Robust Multi-format Date Parser (Timezone shift proof)
 function parseSafeDate(dateStr) {
   if (!dateStr || typeof dateStr !== "string") return null;
   const cleanStr = dateStr.trim();
 
-  // Format: YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(cleanStr)) {
     const [y, m, d] = cleanStr.split("-").map(Number);
     return new Date(y, m - 1, d, 0, 0, 0, 0);
   }
 
-  // Format: MM/DD/YYYY
   if (/^\d{2}\/\d{2}\/\d{4}$/.test(cleanStr)) {
     const [m, d, y] = cleanStr.split("/").map(Number);
     return new Date(y, m - 1, d, 0, 0, 0, 0);
@@ -294,7 +321,7 @@ function processOrder(rawOrder, today) {
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = parseSafeDate(releaseDateRaw);
 
-    // Agar release date na ho ya guzar chuki ho (US Eastern Time), tab Released consider hoga
+    // US timezone based release verification
     const isReleased = !releaseDate || releaseDate.getTime() <= today.getTime();
 
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
@@ -507,7 +534,6 @@ function processOrders(rawOrders) {
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
     if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
 
-    // CGC Visibility Constraint
     if (processed.cgcActiveInOrder) {
       if (!buckets.atGrading.some((o) => o.id === processed.id)) {
         buckets.atGrading.push(processed);
@@ -561,7 +587,7 @@ function processOrders(rawOrders) {
 
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
-  const rawOrders = await fetchAllStoreOrdersUnlimited(admin, "status:any");
+  const rawOrders = await fetchAllStoreOrdersUnlimited(admin);
   const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processOrders(rawOrders);
 
   return jsonResponse({
@@ -659,12 +685,11 @@ function filterGroupsByChannel(groups, selectedChannels) {
     .filter(Boolean);
 }
 
-// Global Clean Search: Handles '#5078', '5078', Customer Name or Email smoothly
 function filterGroupsByQuery(groups, query) {
   if (!query) return groups;
   const rawQ = query.trim().toLowerCase();
-  const cleanQ = rawQ.replace(/^#+/, "").trim(); // Remove leading '#'
-  const pureDigitsOnly = cleanQ.replace(/\D/g, ""); // Extract numbers only if searching order numbers
+  const cleanQ = rawQ.replace(/^#+/, "").trim();
+  const pureDigitsOnly = cleanQ.replace(/\D/g, "");
 
   return groups.filter((group) => {
     const custName = group.customerName.toLowerCase();
@@ -763,7 +788,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           heading="Queue Cleared / No Matching Results"
           image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
         >
-          <p>No matching order records found across the store database.</p>
+          <p>No matching order records found across the active database.</p>
         </EmptyState>
       </Box>
     );
@@ -1008,7 +1033,6 @@ export default function FulfillmentDashboard() {
 
   const activeBucketKey = tabs[selectedTab].bucketKey;
 
-  // SEARCH ACROSS ALL ORDERS REGARDLESS OF TAB OR DATE
   const filteredGroups = useMemo(() => {
     const isSearching = Boolean(queryValue.trim());
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
@@ -1044,7 +1068,7 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Total Store Ingestion: ${totalOrdersCount} Orders Active (Historical Sync)`}
+        subtitle={`Metafield Synchronization Queue Engine • Active Queue: ${totalOrdersCount} Orders Managed`}
         primaryAction={{
           content: "Sync Orders Now",
           icon: RefreshIcon,
@@ -1064,7 +1088,7 @@ export default function FulfillmentDashboard() {
                 <BlockStack gap="400">
                   <Filters
                     queryValue={queryValue}
-                    queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name across ALL tabs & history..."
+                    queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name across ALL tabs..."
                     onQueryChange={setQueryValue}
                     onQueryClear={() => setQueryValue("")}
                     onClearAll={() => { setQueryValue(""); setChannelFilter([]); }}
@@ -1088,7 +1112,7 @@ export default function FulfillmentDashboard() {
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
                       <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across all historical orders and status categories.
+                        Global Search Active: Showing results matching "{queryValue}" across all active queues and channels.
                       </Text>
                     </Banner>
                   )}
