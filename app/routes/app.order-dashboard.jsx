@@ -43,17 +43,16 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. BULK GRAPHQL FETCHING (BOTH ACTIVE & FULFILLED ORDERS)         */
+/*  1. UNLIMITED RECURSIVE STORE FETCHING (ALL ORDERS EVER CREATED)   */
 /* ------------------------------------------------------------------ */
 
-const ORDERS_BATCH_QUERY = `#graphql
-  query FetchOrdersBatch($cursor: String, $queryStr: String) {
+const ALL_STORE_ORDERS_UNLIMITED_QUERY = `#graphql
+  query FetchEntireStoreOrders($cursor: String) {
     orders(
-      first: 100
+      first: 250
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
-      query: $queryStr
     ) {
       pageInfo {
         hasNextPage
@@ -115,51 +114,54 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function fetchAllStoreOrdersUnlimited(admin) {
   const allOrders = [];
   const seenIds = new Set();
+  let cursor = null;
+  let hasNextPage = true;
 
-  // Helper function to safely fetch orders in batches
-  async function fetchBatches(queryFilter, maxBatches) {
-    let cursor = null;
-    let hasNextPage = true;
-    let count = 0;
+  // Koi limit nahi: Jab tak database ka aakhri order fetch na ho jaye yeh chalta rahega
+  while (hasNextPage) {
+    try {
+      const response = await admin.graphql(ALL_STORE_ORDERS_UNLIMITED_QUERY, {
+        variables: { cursor },
+      });
 
-    while (hasNextPage && count < maxBatches) {
-      count++;
-      try {
-        const response = await admin.graphql(ORDERS_BATCH_QUERY, {
-          variables: { cursor, queryStr: queryFilter },
-        });
+      if (response.status === 429) {
+        await delay(2000);
+        continue;
+      }
 
-        if (response.status === 429) {
-          await delay(1200);
+      const payload = await response.json();
+
+      if (payload.errors) {
+        const isThrottled = payload.errors.some(
+          (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
+        );
+        if (isThrottled) {
+          await delay(2000);
           continue;
         }
-
-        const payload = await response.json();
-        const ordersData = payload.data?.orders;
-        if (!ordersData?.edges || ordersData.edges.length === 0) break;
-
-        for (const edge of ordersData.edges) {
-          if (!seenIds.has(edge.node.id)) {
-            seenIds.add(edge.node.id);
-            allOrders.push(edge.node);
-          }
-        }
-
-        hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
-        cursor = ordersData.pageInfo?.endCursor || null;
-        await delay(60);
-      } catch (err) {
-        console.error("Batch Fetch Exception:", err);
         break;
       }
+
+      const ordersData = payload.data?.orders;
+      if (!ordersData?.edges || ordersData.edges.length === 0) break;
+
+      for (const edge of ordersData.edges) {
+        if (!seenIds.has(edge.node.id)) {
+          seenIds.add(edge.node.id);
+          allOrders.push(edge.node);
+        }
+      }
+
+      hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
+      cursor = ordersData.pageInfo?.endCursor || null;
+
+      // Shopify API bucket limit ko safe rakhne ke liye micro pause
+      await delay(50);
+    } catch (err) {
+      console.error("Infinite Fetch Loop Exception:", err);
+      break;
     }
   }
-
-  // STEP 1: Pehle Tamam Open & Unfulfilled Orders fetch karein (Active Queue)
-  await fetchBatches("fulfillment_status:unfulfilled OR fulfillment_status:partial OR status:open", 15);
-
-  // STEP 2: Ab Fulfilled & Completed Orders fetch karein (Ismein client ke #4527, #5078, etc. aayenge)
-  await fetchBatches("fulfillment_status:fulfilled OR status:closed", 15);
 
   return allOrders;
 }
@@ -346,7 +348,7 @@ function processOrder(rawOrder, today) {
   if (isCancelled) {
     bucket = "cancelled";
   } else if (isFullyFulfilled) {
-    bucket = "completed"; // Yahan Jim ke 5 fulfilled orders aayenge
+    bucket = "completed";
   } else {
     const activeItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
     const allAtGrading = activeItems.length > 0 && activeItems.every((li) => li.isAtGrading);
@@ -751,7 +753,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           heading="Queue Cleared / No Matching Results"
           image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
         >
-          <p>No matching order records found.</p>
+          <p>No matching order records found across the entire store database.</p>
         </EmptyState>
       </Box>
     );
@@ -998,7 +1000,6 @@ export default function FulfillmentDashboard() {
 
   const filteredGroups = useMemo(() => {
     const isSearching = Boolean(queryValue.trim());
-    // Global Search across ALL orders if searching, else show active tab
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
     const byChannel = filterGroupsByChannel(base, channelFilter);
     const results = filterGroupsByQuery(byChannel, queryValue);
@@ -1038,7 +1039,7 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Active Ingestion: ${totalOrdersCount} Orders Active`}
+        subtitle={`Metafield Synchronization Queue Engine • Total Orders in Store: ${totalOrdersCount}`}
         primaryAction={{
           content: "Sync Orders Now",
           icon: RefreshIcon,
@@ -1082,7 +1083,7 @@ export default function FulfillmentDashboard() {
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
                       <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across all categories (including Completed & Shipped).
+                        Global Search Active: Showing results matching "{queryValue}" across all orders in store.
                       </Text>
                     </Banner>
                   )}
