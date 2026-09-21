@@ -43,12 +43,12 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. BULK & GUARANTEED TARGET FETCHING                              */
+/*  1. ONLY TARGET 5 ORDERS FETCHING (DIRECT GRAPHQL QUERY)           */
 /* ------------------------------------------------------------------ */
 
-const DIRECT_ORDERS_QUERY = `#graphql
-  query FetchExactOrders($query: String!) {
-    orders(first: 50, query: $query) {
+const DIRECT_TARGET_ORDERS_QUERY = `#graphql
+  query FetchOnlyFiveOrders($queryStr: String!) {
+    orders(first: 20, query: $queryStr) {
       edges {
         node {
           id
@@ -99,136 +99,35 @@ const DIRECT_ORDERS_QUERY = `#graphql
     }
   }
 `;
-
-const GENERAL_STORE_ORDERS_QUERY = `#graphql
-  query FetchAllStoreOrders($cursor: String) {
-    orders(
-      first: 100
-      after: $cursor
-      sortKey: CREATED_AT
-      reverse: true
-    ) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      edges {
-        node {
-          id
-          name
-          createdAt
-          cancelledAt
-          cancelReason
-          displayFulfillmentStatus
-          displayFinancialStatus
-          tags
-          customer {
-            firstName
-            lastName
-          }
-          email
-          shippingAddress {
-            name
-            address1
-            address2
-            city
-            zip
-            country
-          }
-          lineItems(first: 50) {
-            edges {
-              node {
-                id
-                title
-                variantTitle
-                sku
-                quantity
-                unfulfilledQuantity
-                product {
-                  id
-                  tags
-                  metafield(namespace: "custom", key: "release_date") {
-                    value
-                  }
-                  focMetafield: metafield(namespace: "custom", key: "foc_date") {
-                    value
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-`;
-
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function fetchAllStoreOrdersUnlimited(admin) {
   const allOrders = [];
   const seenIds = new Set();
 
-  // STEP 1: Client ke 5 orders guaranteed pull karne ke liye
-  const targetNumbers = ["4527", "5078", "5199", "5211", "5413"];
+  // Sirf Jim ke bataye hue 5 orders ki queries
   const targetQueries = [
-    targetNumbers.map((n) => `name:#${n}`).join(" OR "),
-    targetNumbers.map((n) => `name:${n}`).join(" OR "),
+    "name:#4527 OR name:#5078 OR name:#5199 OR name:#5211 OR name:#5413",
+    "name:4527 OR name:5078 OR name:5199 OR name:5211 OR name:5413",
+    "4527 OR 5078 OR 5199 OR 5211 OR 5413"
   ];
 
   for (const q of targetQueries) {
     try {
-      const targetResponse = await admin.graphql(DIRECT_ORDERS_QUERY, {
-        variables: { query: q },
+      const response = await admin.graphql(DIRECT_TARGET_ORDERS_QUERY, {
+        variables: { queryStr: q },
       });
-      const targetPayload = await targetResponse.json();
-      const targetedEdges = targetPayload.data?.orders?.edges || [];
-
-      for (const edge of targetedEdges) {
-        if (!seenIds.has(edge.node.id)) {
-          seenIds.add(edge.node.id);
-          allOrders.push(edge.node);
-        }
-      }
-    } catch (err) {
-      console.error("Direct Target Fetch Error:", err);
-    }
-  }
-
-  // STEP 2: General store orders bina timeout e fetch karva
-  let cursor = null;
-  let hasNextPage = true;
-  let batchCount = 0;
-
-  while (hasNextPage && batchCount < 15) {
-    batchCount++;
-    try {
-      const response = await admin.graphql(GENERAL_STORE_ORDERS_QUERY, {
-        variables: { cursor },
-      });
-
-      if (response.status === 429) {
-        await delay(1200);
-        continue;
-      }
 
       const payload = await response.json();
-      const ordersData = payload.data?.orders;
-      if (!ordersData?.edges || ordersData.edges.length === 0) break;
+      const edges = payload.data?.orders?.edges || [];
 
-      for (const edge of ordersData.edges) {
+      for (const edge of edges) {
         if (!seenIds.has(edge.node.id)) {
           seenIds.add(edge.node.id);
           allOrders.push(edge.node);
         }
       }
-
-      hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
-      cursor = ordersData.pageInfo?.endCursor || null;
-      await delay(60);
     } catch (err) {
-      console.error("General Batch Error:", err);
-      break;
+      console.error("Direct 5 Orders Fetch Error:", err);
     }
   }
 
@@ -999,7 +898,7 @@ function FocPullListView({ focGroups }) {
                         <Text as="span">{formatDate(item.releaseDate)}</Text>
                       </td>
                       <td style={{ padding: "12px 12px", verticalAlign: "top" }}>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center" }}>
+                        <div style={{ display: "flexWrap", flexWrap: "wrap", gap: "6px", alignItems: "center" }}>
                           {item.orders.map((o, oIdx) => (
                             <Tooltip key={oIdx} content={`${o.customer} (${o.sourceName})`}>
                               <Badge tone={o.sourceName === "ebay" ? "info" : "base"}>{o.orderName}</Badge>
@@ -1108,7 +1007,7 @@ export default function FulfillmentDashboard() {
 
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Active Ingestion: ${totalOrdersCount} Orders Loaded`}
+        subtitle={`Metafield Synchronization Queue Engine • Direct Mode: ${totalOrdersCount} Targeted Orders Loaded`}
         primaryAction={{
           content: "Sync Orders Now",
           icon: RefreshIcon,
@@ -1152,7 +1051,7 @@ export default function FulfillmentDashboard() {
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
                       <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across all loaded orders.
+                        Global Search Active: Showing results matching "{queryValue}" across all direct orders.
                       </Text>
                     </Banner>
                   )}
