@@ -43,12 +43,12 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. BULK & TARGETED FETCHING (GUARANTEED ORDER INGESTION)          */
+/*  1. DIRECT TARGET + GENERAL BATCH QUERY (NO SYNTAX ERRORS)         */
 /* ------------------------------------------------------------------ */
 
-const SPECIFIC_ORDERS_QUERY = `#graphql
-  query FetchTargetOrders($queryStr: String) {
-    orders(first: 20, query: $queryStr) {
+const TARGET_ORDERS_QUERY = `#graphql
+  query FetchTargetSpecificOrders($queryString: String!) {
+    orders(first: 20, query: $queryString) {
       edges {
         node {
           id
@@ -100,14 +100,13 @@ const SPECIFIC_ORDERS_QUERY = `#graphql
   }
 `;
 
-const ALL_ORDERS_QUERY = `#graphql
+const GENERAL_STORE_ORDERS_QUERY = `#graphql
   query FetchAllStoreOrders($cursor: String) {
     orders(
-      first: 150
+      first: 100
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
-      query: "status:any"
     ) {
       pageInfo {
         hasNextPage
@@ -170,15 +169,14 @@ async function fetchAllStoreOrdersUnlimited(admin) {
   const allOrders = [];
   const seenIds = new Set();
 
-  // STEP 1: Client ke un 5 orders ko direct query se guaranteed pull karein
+  // STEP 1: Client ke un 5 orders ko exact name/number se guarantee fetch karein
   try {
-    const targetQuery =
-      "name:#4527 OR name:#5078 OR name:#5199 OR name:#5211 OR name:#5413 OR name:4527 OR name:5078 OR name:5199 OR name:5211 OR name:5413";
-    const targetRes = await admin.graphql(SPECIFIC_ORDERS_QUERY, {
-      variables: { queryStr: targetQuery },
+    const targetQueryString = "4527 OR 5078 OR 5199 OR 5211 OR 5413";
+    const targetResponse = await admin.graphql(TARGET_ORDERS_QUERY, {
+      variables: { queryString: targetQueryString },
     });
 
-    const targetPayload = await targetRes.json();
+    const targetPayload = await targetResponse.json();
     const targetedEdges = targetPayload.data?.orders?.edges || [];
 
     for (const edge of targetedEdges) {
@@ -188,10 +186,10 @@ async function fetchAllStoreOrdersUnlimited(admin) {
       }
     }
   } catch (err) {
-    console.error("Direct Target Orders Ingestion Error:", err);
+    console.error("Direct Target Fetch Error:", err);
   }
 
-  // STEP 2: Baqi store orders status:any ke sath fast batches mein fetch karein
+  // STEP 2: Baqi store orders bina kisi invalid syntax filter ke smoothly fetch karein
   let cursor = null;
   let hasNextPage = true;
   let batchCount = 0;
@@ -199,7 +197,7 @@ async function fetchAllStoreOrdersUnlimited(admin) {
   while (hasNextPage && batchCount < 20) {
     batchCount++;
     try {
-      const response = await admin.graphql(ALL_ORDERS_QUERY, {
+      const response = await admin.graphql(GENERAL_STORE_ORDERS_QUERY, {
         variables: { cursor },
       });
 
@@ -221,9 +219,9 @@ async function fetchAllStoreOrdersUnlimited(admin) {
 
       hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
       cursor = ordersData.pageInfo?.endCursor || null;
-      await delay(70);
+      await delay(60);
     } catch (err) {
-      console.error("Bulk Pipeline Fetch Exception:", err);
+      console.error("Bulk Orders Pipeline Error:", err);
       break;
     }
   }
@@ -337,15 +335,12 @@ function buildCustomerKey(order) {
 }
 
 function processOrder(rawOrder, today) {
-  if (!rawOrder.lineItems?.edges) return null;
-
-  const allRawItems = rawOrder.lineItems.edges.map((edge) => edge.node);
-  if (allRawItems.length === 0) return null;
+  const allRawItems = rawOrder.lineItems?.edges ? rawOrder.lineItems.edges.map((edge) => edge.node) : [];
 
   const isCancelled = Boolean(rawOrder.cancelledAt);
   const isFullyFulfilled =
     rawOrder.displayFulfillmentStatus === "FULFILLED" ||
-    allRawItems.every((li) => li.unfulfilledQuantity === 0);
+    (allRawItems.length > 0 && allRawItems.every((li) => li.unfulfilledQuantity === 0));
 
   const orderHasCgcRemovalTag = hasCgcRemovalTag(rawOrder.tags);
 
@@ -353,7 +348,7 @@ function processOrder(rawOrder, today) {
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = parseSafeDate(releaseDateRaw);
 
-    // US timezone check: Agar release date nahi hai ya date guzar chuki hai toh released
+    // Agar release date na ho (ya eBay unlinked product ho) toh released maana jayega
     const isReleased = !releaseDate || releaseDate.getTime() <= today.getTime();
 
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
@@ -422,7 +417,9 @@ function processOrder(rawOrder, today) {
     const activeItems = lineItems.filter((li) => li.unfulfilledQuantity > 0);
     const allAtGrading = activeItems.length > 0 && activeItems.every((li) => li.isAtGrading);
     const allPreOrder = activeItems.length > 0 && activeItems.every((li) => !li.isReleased && !li.isAtGrading);
-    const allReadyToShip = activeItems.length > 0 && activeItems.every((li) => (li.isReleased && !li.isAtGrading) || (li.isCgc && li.isGradingReturned));
+    const allReadyToShip =
+      activeItems.length === 0 ||
+      activeItems.every((li) => (li.isReleased && !li.isAtGrading) || (li.isCgc && li.isGradingReturned));
 
     if (allReadyToShip) {
       bucket = "readyToShip";
@@ -1069,7 +1066,14 @@ export default function FulfillmentDashboard() {
     const isSearching = Boolean(queryValue.trim());
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
     const byChannel = filterGroupsByChannel(base, channelFilter);
-    return filterGroupsByQuery(byChannel, queryValue);
+    const results = filterGroupsByQuery(byChannel, queryValue);
+
+    // Search ke doraan matching cards ko automatically open kar do
+    if (isSearching) {
+      setExpandedGroups(new Set(results.map((r) => r.key)));
+    }
+
+    return results;
   }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue]);
 
   const totalPages = Math.ceil(filteredGroups.length / PAGE_SIZE) || 1;
