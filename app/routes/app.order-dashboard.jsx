@@ -44,17 +44,16 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. BULK GRAPHQL FETCHING (BOTH ACTIVE & FULFILLED ORDERS)         */
+/*  1. UNLIMITED RECURSIVE STORE FETCHING (MAX 250 PER PAGE)          */
 /* ------------------------------------------------------------------ */
 
-const ORDERS_BATCH_QUERY = `#graphql
-  query FetchOrdersBatch($cursor: String, $queryStr: String) {
+const ALL_STORE_ORDERS_QUERY = `#graphql
+  query FetchAllStoreOrders($cursor: String) {
     orders(
-      first: 100
+      first: 250
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
-      query: $queryStr
     ) {
       pageInfo {
         hasNextPage
@@ -116,68 +115,54 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function fetchAllStoreOrdersUnlimited(admin) {
   const allOrders = [];
   const seenIds = new Set();
+  let cursor = null;
+  let hasNextPage = true;
+  let pageCount = 0;
 
-  async function fetchBatches(queryFilter, maxBatches) {
-    let cursor = null;
-    let hasNextPage = true;
-    let count = 0;
+  // 250 per call se 10,000 orders tak bina timeout ke fast load honge
+  while (hasNextPage && pageCount < 40) {
+    pageCount++;
+    try {
+      const response = await admin.graphql(ALL_STORE_ORDERS_QUERY, {
+        variables: { cursor },
+      });
 
-    while (hasNextPage && count < maxBatches) {
-      count++;
-      try {
-        const response = await admin.graphql(ORDERS_BATCH_QUERY, {
-          variables: { cursor, queryStr: queryFilter },
-        });
+      if (response.status === 429) {
+        await delay(1500);
+        continue;
+      }
 
-        if (response.status === 429) {
-          await delay(1200);
+      const payload = await response.json();
+
+      if (payload.errors) {
+        const isThrottled = payload.errors.some(
+          (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
+        );
+        if (isThrottled) {
+          await delay(1500);
           continue;
         }
-
-        const payload = await response.json();
-        const ordersData = payload.data?.orders;
-        if (!ordersData?.edges || ordersData.edges.length === 0) break;
-
-        for (const edge of ordersData.edges) {
-          if (!seenIds.has(edge.node.id)) {
-            seenIds.add(edge.node.id);
-            allOrders.push(edge.node);
-          }
-        }
-
-        hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
-        cursor = ordersData.pageInfo?.endCursor || null;
-        await delay(50);
-      } catch (err) {
-        console.error("Batch Fetch Exception:", err);
         break;
       }
-    }
-  }
 
-  // Pehle Jim Adams ke bataye hue target orders ko direct grab karein
-  try {
-    const directTargetQuery = "name:#4527 OR name:#5078 OR name:#5199 OR name:#5211 OR name:#5413 OR 4527 OR 5078 OR 5199 OR 5211 OR 5413";
-    const directRes = await admin.graphql(ORDERS_BATCH_QUERY, {
-      variables: { cursor: null, queryStr: directTargetQuery },
-    });
-    const directPayload = await directRes.json();
-    const directEdges = directPayload.data?.orders?.edges || [];
-    for (const edge of directEdges) {
-      if (!seenIds.has(edge.node.id)) {
-        seenIds.add(edge.node.id);
-        allOrders.push(edge.node);
+      const ordersData = payload.data?.orders;
+      if (!ordersData?.edges || ordersData.edges.length === 0) break;
+
+      for (const edge of ordersData.edges) {
+        if (!seenIds.has(edge.node.id)) {
+          seenIds.add(edge.node.id);
+          allOrders.push(edge.node);
+        }
       }
+
+      hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
+      cursor = ordersData.pageInfo?.endCursor || null;
+      await delay(30);
+    } catch (err) {
+      console.error("Fetch Loop Error:", err);
+      break;
     }
-  } catch (err) {
-    console.error("Target Fetch Error:", err);
   }
-
-  // Store ke saare active orders
-  await fetchBatches("status:open", 20);
-
-  // Store ke saare fulfilled/closed orders
-  await fetchBatches("status:closed", 20);
 
   return allOrders;
 }
