@@ -6,8 +6,8 @@ embedded = true
 name = "Order Manager"
 
 [access_scopes]
-# Added read_customers scope to allow fetching order buyer information
-scopes = "read_products, read_orders, write_orders, read_customers"
+# Added read_all_orders to access orders older than 60 days
+scopes = "read_products, read_orders, write_orders, read_customers, read_all_orders"
 
 [webhooks]
 api_version = "2026-04"
