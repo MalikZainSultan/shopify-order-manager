@@ -122,7 +122,7 @@ async function fetchAllStoreOrdersUnlimited(admin) {
   let hasNextPage = true;
   let pageCount = 0;
 
-  // Har call me 250 orders bina timeout aur bina complexity error ke load honge
+  // 250 per call se maximum orders fast load honge without hitting nested cost limits
   while (hasNextPage && pageCount < 40) {
     pageCount++;
     try {
@@ -138,7 +138,7 @@ async function fetchAllStoreOrdersUnlimited(admin) {
       const payload = await response.json();
 
       if (payload.errors) {
-        console.error("GraphQL Error:", JSON.stringify(payload.errors));
+        console.error("Shopify GraphQL Error:", JSON.stringify(payload.errors));
         const isThrottled = payload.errors.some(
           (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
         );
@@ -286,18 +286,22 @@ function processOrder(rawOrder, today) {
 
   const orderHasCgcRemovalTag = hasCgcRemovalTag(rawOrder.tags);
 
+  // Check Order Tags
   const orderTags = Array.isArray(rawOrder.tags) ? rawOrder.tags.map((t) => (t || "").toLowerCase().trim()) : [];
   const hasOrderShipHoldTag = orderTags.some((t) => t === "ship-hold" || t === "hold" || t.includes("ship-hold"));
+
+  // Check Shopify Native Fulfillment Hold
   const hasNativeFulfillmentHold = rawOrder.displayFulfillmentStatus === "ON_HOLD";
 
   const isOnHold = !isCancelled && !isFullyFulfilled && (hasOrderShipHoldTag || hasNativeFulfillmentHold);
 
+  // Check Customer Profile Tags
   const customerTags = Array.isArray(rawOrder.customer?.tags)
     ? rawOrder.customer.tags.map((t) => (t || "").toLowerCase().trim())
     : [];
   const customerHasHoldTag = customerTags.some((t) => t === "ship-hold" || t.includes("ship-hold"));
 
-  // Safety Net Flag: Customer par hold tag hai magar is active order par nahi laga
+  // Safety Net Flag: Customer profile is marked with ship-hold, but this active order lacks tag & hold status
   const isSafetyNetFlagged = !isCancelled && !isFullyFulfilled && customerHasHoldTag && !isOnHold;
 
   const lineItems = allRawItems.map((li) => {
@@ -540,7 +544,7 @@ function processOrders(rawOrders) {
   const buckets = {
     allUnfulfilled: [],
     readyToShip: [],
-    onHold: [], // Dedicated On Hold Bucket
+    onHold: [], // Dedicated On-Hold Bucket
     atGrading: [],
     partiallyReady: [],
     waitingOnRelease: [],
@@ -558,13 +562,14 @@ function processOrders(rawOrders) {
 
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
 
-    // FEATURE: HOLD PROTECTION & ISOLATION
+    // On-Hold Orders ko alag bucket mein track karte hain
     if (processed.isOnHold) {
       buckets.onHold.push(processed);
     }
 
+    // FEATURE 2: PRINT & COUNT PROTECTION
+    // If order is ON HOLD, exclude it from clean Ready to Ship queue
     if (processed.bucket === "readyToShip") {
-      // Held orders are excluded from the main ready to ship processing queue
       if (!processed.isOnHold) {
         buckets.readyToShip.push(processed);
       }
@@ -604,7 +609,7 @@ function processOrders(rawOrders) {
     groups: {
       allUnfulfilled: groupByCustomer(buckets.allUnfulfilled),
       readyToShip: groupByCustomer(buckets.readyToShip),
-      onHold: groupByCustomer(buckets.onHold),
+      onHold: groupByCustomer(buckets.onHold), // Dedicated On-Hold Tab Groups
       atGrading: groupByCustomer(buckets.atGrading),
       partiallyReady: groupByCustomer(buckets.partiallyReady),
       waitingOnRelease: groupByCustomer(buckets.waitingOnRelease),
@@ -614,7 +619,7 @@ function processOrders(rawOrders) {
     counts: {
       allUnfulfilled: buckets.allUnfulfilled.length,
       readyToShip: buckets.readyToShip.length,
-      onHold: buckets.onHold.length,
+      onHold: buckets.onHold.length, // Dedicated On-Hold Tab Count
       atGrading: buckets.atGrading.length,
       partiallyReady: buckets.partiallyReady.length,
       waitingOnRelease: buckets.waitingOnRelease.length,
@@ -1146,7 +1151,7 @@ export default function FulfillmentDashboard() {
     });
   }, []);
 
-  // ALL TABS INCLUDED PROPERLY INCLUDING DEDICATED ON-HOLD TAB
+  // Dedicated "On Hold Orders" tab added with its live badge count
   const tabs = [
     { id: "all-unfulfilled", content: "Unfulfilled Orders", badgeCount: counts.allUnfulfilled, bucketKey: "allUnfulfilled" },
     { id: "ready-to-ship", content: "Ready to Ship", badgeCount: counts.readyToShip, bucketKey: "readyToShip" },
@@ -1245,9 +1250,9 @@ export default function FulfillmentDashboard() {
 
                   {activeBucketKey === "onHold" && !queryValue.trim() && (
                     <Banner tone="warning" icon={LockIcon}>
-                      <Text as="p" fontWeight="semibold">Fulfillment Hold Protected Queue</Text>
+                      <Text as="p" fontWeight="semibold">Fulfillment Hold Queue</Text>
                       <Text as="p">
-                        All orders tagged with <code>ship-hold</code> or placed in native Shopify fulfillment hold are isolated here. Slip printing and batch shipping are locked until hold release.
+                        Yeh saare orders <code>ship-hold</code> tag ya native Shopify fulfillment hold par hain. Hold release hone tak inka batch shipping aur pick slip generation locked rahega.
                       </Text>
                     </Banner>
                   )}
@@ -1261,7 +1266,7 @@ export default function FulfillmentDashboard() {
                     </Banner>
                   )}
 
-                  {selectedTab === 4 && !queryValue.trim() && (
+                  {activeBucketKey === "partiallyReady" && !queryValue.trim() && (
                     <Banner tone="warning" icon={PackageIcon}>
                       <Text as="p" fontWeight="semibold">Warehouse Extract / Harvest Pull List</Text>
                       <Text as="p">Extract these line items from storage racks immediately. They are physically released but bound inside composite pre-order allocations.</Text>
@@ -1271,7 +1276,7 @@ export default function FulfillmentDashboard() {
                     </Banner>
                   )}
 
-                  {selectedTab === 5 && !queryValue.trim() && (
+                  {activeBucketKey === "waitingOnRelease" && !queryValue.trim() && (
                     <BlockStack gap="300">
                       <Banner tone="info" icon={CalendarIcon}>
                         <Text as="p" fontWeight="semibold">FOC Weekly Ordering Pull List</Text>
