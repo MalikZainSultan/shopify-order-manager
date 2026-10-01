@@ -76,18 +76,6 @@ const ALL_STORE_ORDERS_QUERY = `#graphql
             lastName
             tags
           }
-          fulfillmentOrders(first: 10) {
-            edges {
-              node {
-                id
-                status
-                fulfillmentHolds {
-                  reason
-                  reasonNotes
-                }
-              }
-            }
-          }
           email
           shippingAddress {
             name
@@ -134,6 +122,7 @@ async function fetchAllStoreOrdersUnlimited(admin) {
   let hasNextPage = true;
   let pageCount = 0;
 
+  // 250 per call se maximum orders fast load honge without hitting nested cost limits
   while (hasNextPage && pageCount < 40) {
     pageCount++;
     try {
@@ -149,6 +138,7 @@ async function fetchAllStoreOrdersUnlimited(admin) {
       const payload = await response.json();
 
       if (payload.errors) {
+        console.error("Shopify GraphQL Error:", JSON.stringify(payload.errors));
         const isThrottled = payload.errors.some(
           (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
         );
@@ -296,22 +286,22 @@ function processOrder(rawOrder, today) {
 
   const orderHasCgcRemovalTag = hasCgcRemovalTag(rawOrder.tags);
 
+  // Check Order Tags
   const orderTags = Array.isArray(rawOrder.tags) ? rawOrder.tags.map((t) => (t || "").toLowerCase().trim()) : [];
-  const hasOrderShipHoldTag = orderTags.includes("ship-hold");
+  const hasOrderShipHoldTag = orderTags.some((t) => t === "ship-hold" || t === "hold" || t.includes("ship-hold"));
 
-  const fulfillmentOrders = rawOrder.fulfillmentOrders?.edges ? rawOrder.fulfillmentOrders.edges.map((e) => e.node) : [];
-  const hasFulfillmentHold = fulfillmentOrders.some(
-    (fo) => Array.isArray(fo.fulfillmentHolds) && fo.fulfillmentHolds.length > 0
-  );
+  // Check Shopify Native Fulfillment Hold
+  const hasNativeFulfillmentHold = rawOrder.displayFulfillmentStatus === "ON_HOLD";
 
-  const isOnHold = !isCancelled && !isFullyFulfilled && (hasOrderShipHoldTag || hasFulfillmentHold);
+  const isOnHold = !isCancelled && !isFullyFulfilled && (hasOrderShipHoldTag || hasNativeFulfillmentHold);
 
+  // Check Customer Profile Tags
   const customerTags = Array.isArray(rawOrder.customer?.tags)
     ? rawOrder.customer.tags.map((t) => (t || "").toLowerCase().trim())
     : [];
-  const customerHasHoldTag = customerTags.includes("ship-hold");
+  const customerHasHoldTag = customerTags.some((t) => t === "ship-hold" || t.includes("ship-hold"));
 
-  // Safety Net Flag: Customer has hold tag but this active order misses both the order tag and fulfillment hold
+  // Safety Net Flag: Customer profile is marked with ship-hold, but this active order lacks tag & hold status
   const isSafetyNetFlagged = !isCancelled && !isFullyFulfilled && customerHasHoldTag && !isOnHold;
 
   const lineItems = allRawItems.map((li) => {
@@ -439,7 +429,6 @@ function groupByCustomer(orders) {
         first.shippingAddress?.name ||
         "Unknown Buyer";
 
-      // Compute Hold Breakdown for this customer
       let heldOrdersCount = 0;
       let readyItemsCount = 0;
       let waitingItemsCount = 0;
