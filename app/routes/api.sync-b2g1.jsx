@@ -8,7 +8,6 @@ const jsonResponse = (data, status = 200) => {
   });
 };
 
-// Rate-limiting delay helper
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const loader = async ({ request }) => {
@@ -23,18 +22,20 @@ export const loader = async ({ request }) => {
       const url = new URL(request.url);
       const shopParam = url.searchParams.get("shop") || "yppy8z-d9.myshopify.com";
 
-      const session = await prisma.session.findFirst({
-        where: { shop: { contains: shopParam.replace(".myshopify.com", "") } },
-        orderBy: { id: "desc" },
-      }) || await prisma.session.findFirst({
-        orderBy: { id: "desc" },
-      });
+      const session =
+        (await prisma.session.findFirst({
+          where: { shop: { contains: shopParam.replace(".myshopify.com", "") } },
+          orderBy: { id: "desc" },
+        })) ||
+        (await prisma.session.findFirst({
+          orderBy: { id: "desc" },
+        }));
 
       if (!session) {
         return jsonResponse({
           success: false,
-          message: "No active session found in database.",
-        }, 200);
+          error: "No active session found in database.",
+        });
       }
 
       const client = new shopify.api.clients.Graphql({ session });
@@ -79,6 +80,12 @@ export const loader = async ({ request }) => {
       );
 
       const payload = await response.json();
+
+      if (payload.errors) {
+        const errorMsg = payload.errors.map((e) => e.message).join(", ");
+        throw new Error(errorMsg);
+      }
+
       const products = payload.data?.products?.nodes || [];
 
       for (const product of products) {
@@ -86,45 +93,62 @@ export const loader = async ({ request }) => {
         const hasExclude = tags.includes("exclude-b2g1");
         const hasTag = tags.includes("b2g1-eligible");
 
-        // Agar release date missing ya empty ho to skip karein (Crash se bachata hai)
         if (!product.releaseDate?.value || product.releaseDate.value.trim() === "") {
           continue;
         }
 
         const releaseDate = new Date(product.releaseDate.value);
         if (isNaN(releaseDate.getTime())) {
-          continue; // Invalid date format par crash nahi hone dega
+          continue;
         }
 
         const isEligible = releaseDate <= cutoffDate;
 
         if (isEligible && !hasExclude) {
           if (!hasTag) {
-            await admin.graphql(
+            const addRes = await admin.graphql(
               `#graphql
               mutation addTag($id: ID!, $tags: [String!]!) {
                 tagsAdd(id: $id, tags: $tags) {
-                  userErrors { message }
+                  userErrors { message field }
                 }
               }`,
               { variables: { id: product.id, tags: ["b2g1-eligible"] } }
             );
-            updatedCount++;
-            await sleep(50); // Shopify rate limit safe pause
+
+            const addPayload = await addRes.json();
+            if (addPayload.errors) {
+              throw new Error(addPayload.errors[0]?.message || "Access denied on tagsAdd");
+            }
+            if (addPayload.data?.tagsAdd?.userErrors?.length > 0) {
+              console.warn("tagsAdd UserError:", addPayload.data.tagsAdd.userErrors);
+            } else {
+              updatedCount++;
+            }
+            await sleep(60);
           }
         } else {
           if (hasTag) {
-            await admin.graphql(
+            const remRes = await admin.graphql(
               `#graphql
               mutation removeTag($id: ID!, $tags: [String!]!) {
                 tagsRemove(id: $id, tags: $tags) {
-                  userErrors { message }
+                  userErrors { message field }
                 }
               }`,
               { variables: { id: product.id, tags: ["b2g1-eligible"] } }
             );
-            updatedCount++;
-            await sleep(50); // Shopify rate limit safe pause
+
+            const remPayload = await remRes.json();
+            if (remPayload.errors) {
+              throw new Error(remPayload.errors[0]?.message || "Access denied on tagsRemove");
+            }
+            if (remPayload.data?.tagsRemove?.userErrors?.length > 0) {
+              console.warn("tagsRemove UserError:", remPayload.data.tagsRemove.userErrors);
+            } else {
+              updatedCount++;
+            }
+            await sleep(60);
           }
         }
       }
@@ -136,7 +160,13 @@ export const loader = async ({ request }) => {
     return jsonResponse({ success: true, updatedCount });
   } catch (error) {
     console.error("B2G1 Sync Error:", error);
-    // Hamesha 200 return karega taake front-end ya cron 500 error pe crash na ho
-    return jsonResponse({ success: false, error: error.message || "Unknown sync error" }, 200);
+    
+    // Agar scope issue ho to front-end par helpful guideline message jaye
+    let readableError = error.message || "Unknown sync error";
+    if (readableError.includes("Access denied for tagsAdd") || readableError.includes("Access denied")) {
+      readableError = "Shopify Permission Missing: Please add 'write_products' scope in shopify.app.toml and re-authenticate the app.";
+    }
+
+    return jsonResponse({ success: false, error: readableError }, 200);
   }
 };
