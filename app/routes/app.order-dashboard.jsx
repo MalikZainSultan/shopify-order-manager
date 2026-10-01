@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useCallback, useEffect } from "react";
-import { useLoaderData, useFetcher } from "react-router";
+import { useLoaderData, useFetcher, useSearchParams, useNavigate } from "react-router";
 import {
   AppProvider,
   Page,
@@ -45,16 +45,27 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED RECURSIVE STORE FETCHING (MAX 250 PER PAGE)          */
+/*  1. TAB CONFIGURATION & FAST TARGETED GRAPHQL QUERY                */
 /* ------------------------------------------------------------------ */
 
-const ALL_STORE_ORDERS_QUERY = `#graphql
-  query FetchAllStoreOrders($cursor: String) {
+const TAB_CONFIG = [
+  { id: "all-unfulfilled", content: "Unfulfilled Orders", bucketKey: "allUnfulfilled", shopifyQuery: "fulfillment_status:unfulfilled AND status:open" },
+  { id: "ready-to-ship", content: "Ready to Ship", bucketKey: "readyToShip", shopifyQuery: "fulfillment_status:unfulfilled AND status:open" },
+  { id: "at-grading", content: "At Grading (CGC)", bucketKey: "atGrading", shopifyQuery: "fulfillment_status:unfulfilled AND status:open" },
+  { id: "partially-ready", content: "Partially Ready", bucketKey: "partiallyReady", shopifyQuery: "fulfillment_status:unfulfilled AND status:open" },
+  { id: "waiting-on-release", content: "Waiting on Release", bucketKey: "waitingOnRelease", shopifyQuery: "fulfillment_status:unfulfilled AND status:open" },
+  { id: "completed-shipped", content: "Completed / Shipped", bucketKey: "completed", shopifyQuery: "fulfillment_status:fulfilled" },
+  { id: "cancelled-orders", content: "Cancelled Orders", bucketKey: "cancelled", shopifyQuery: "status:cancelled" },
+];
+
+const FAST_PAGE_ORDERS_QUERY = `#graphql
+  query FetchTargetOrders($first: Int!, $cursor: String, $query: String) {
     orders(
-      first: 250
+      first: $first
       after: $cursor
       sortKey: CREATED_AT
       reverse: true
+      query: $query
     ) {
       pageInfo {
         hasNextPage
@@ -112,64 +123,6 @@ const ALL_STORE_ORDERS_QUERY = `#graphql
     }
   }
 `;
-
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function fetchAllStoreOrdersUnlimited(admin) {
-  const allOrders = [];
-  const seenIds = new Set();
-  let cursor = null;
-  let hasNextPage = true;
-  let pageCount = 0;
-
-  // 250 per call se maximum orders fast load honge without hitting nested cost limits
-  while (hasNextPage && pageCount < 40) {
-    pageCount++;
-    try {
-      const response = await admin.graphql(ALL_STORE_ORDERS_QUERY, {
-        variables: { cursor },
-      });
-
-      if (response.status === 429) {
-        await delay(1500);
-        continue;
-      }
-
-      const payload = await response.json();
-
-      if (payload.errors) {
-        console.error("Shopify GraphQL Error:", JSON.stringify(payload.errors));
-        const isThrottled = payload.errors.some(
-          (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
-        );
-        if (isThrottled) {
-          await delay(1500);
-          continue;
-        }
-        break;
-      }
-
-      const ordersData = payload.data?.orders;
-      if (!ordersData?.edges || ordersData.edges.length === 0) break;
-
-      for (const edge of ordersData.edges) {
-        if (!seenIds.has(edge.node.id)) {
-          seenIds.add(edge.node.id);
-          allOrders.push(edge.node);
-        }
-      }
-
-      hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
-      cursor = ordersData.pageInfo?.endCursor || null;
-      await delay(30);
-    } catch (err) {
-      console.error("Fetch Loop Error:", err);
-      break;
-    }
-  }
-
-  return allOrders;
-}
 
 /* ------------------------------------------------------------------ */
 /*  2. US TIMEZONE & DATA PROCESSING ENGINE                           */
@@ -241,10 +194,7 @@ function detectChannel(order) {
   const hasEbayTag = tagList.some((t) => t.includes("ebay") || t.includes("cedcommerce"));
   const isEbayOrderNumber = orderName.includes("ebay") || /^\d{2}-\d{5}-\d{5}/.test(order.name ? order.name.trim() : "");
 
-  if (hasEbayTag || isEbayOrderNumber) {
-    return "ebay";
-  }
-
+  if (hasEbayTag || isEbayOrderNumber) return "ebay";
   if (tagList.some((t) => t.includes("whatnot"))) return "whatnot";
   return "shopify";
 }
@@ -262,7 +212,6 @@ function hasCgcRemovalTag(orderTags = [], lineItemId = null) {
 
   if (tags.some((t) => validTags.includes(t))) return true;
   if (lineItemId && tags.some((t) => t === `cgc-returned-${lineItemId}`.toLowerCase())) return true;
-
   return false;
 }
 
@@ -285,23 +234,16 @@ function processOrder(rawOrder, today) {
     (allRawItems.length > 0 && allRawItems.every((li) => li.unfulfilledQuantity === 0));
 
   const orderHasCgcRemovalTag = hasCgcRemovalTag(rawOrder.tags);
-
-  // Check Order Tags
   const orderTags = Array.isArray(rawOrder.tags) ? rawOrder.tags.map((t) => (t || "").toLowerCase().trim()) : [];
   const hasOrderShipHoldTag = orderTags.some((t) => t === "ship-hold" || t === "hold" || t.includes("ship-hold"));
-
-  // Check Shopify Native Fulfillment Hold
   const hasNativeFulfillmentHold = rawOrder.displayFulfillmentStatus === "ON_HOLD";
 
   const isOnHold = !isCancelled && !isFullyFulfilled && (hasOrderShipHoldTag || hasNativeFulfillmentHold);
 
-  // Check Customer Profile Tags
   const customerTags = Array.isArray(rawOrder.customer?.tags)
     ? rawOrder.customer.tags.map((t) => (t || "").toLowerCase().trim())
     : [];
   const customerHasHoldTag = customerTags.some((t) => t === "ship-hold" || t.includes("ship-hold"));
-
-  // Safety Net Flag: Customer profile is marked with ship-hold, but this active order lacks tag & hold status
   const isSafetyNetFlagged = !isCancelled && !isFullyFulfilled && customerHasHoldTag && !isOnHold;
 
   const lineItems = allRawItems.map((li) => {
@@ -309,11 +251,9 @@ function processOrder(rawOrder, today) {
     const releaseDate = parseSafeDate(releaseDateRaw);
 
     const isReleased = !releaseDate || releaseDate.getTime() <= today.getTime();
-
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
     const isCgc = isCgcItem(li);
     const isReturned = orderHasCgcRemovalTag || hasCgcRemovalTag(rawOrder.tags, li.id);
-
     const isAtGrading = isCgc && !isReturned;
 
     let estimatedGradingReadyDate = null;
@@ -539,108 +479,86 @@ function buildFocPullList(waitingOrders) {
     });
 }
 
-function processOrders(rawOrders) {
+/* ------------------------------------------------------------------ */
+/*  3. FAST LOADER FUNCTION (SUB-SECOND LOAD TIME)                    */
+/* ------------------------------------------------------------------ */
+
+export const loader = async ({ request }) => {
+  const { admin } = await authenticate.admin(request);
+  const url = new URL(request.url);
+
+  const activeTabId = url.searchParams.get("tab") || "all-unfulfilled";
+  const cursor = url.searchParams.get("cursor") || null;
+  const searchQuery = url.searchParams.get("q") || "";
+
+  const activeConfig = TAB_CONFIG.find((t) => t.id === activeTabId) || TAB_CONFIG[0];
+  let finalShopifyQuery = searchQuery.trim() ? searchQuery.trim() : activeConfig.shopifyQuery;
+
+  // Single fast call - 60 orders per page in less than 1 second
+  const response = await admin.graphql(FAST_PAGE_ORDERS_QUERY, {
+    variables: {
+      first: 60,
+      cursor: cursor,
+      query: finalShopifyQuery,
+    },
+  });
+
+  const payload = await response.json();
+  const rawOrders = payload.data?.orders?.edges?.map((e) => e.node) || [];
+  const pageInfo = payload.data?.orders?.pageInfo || { hasNextPage: false, endCursor: null };
+
   const today = startOfTodayInUS();
-  const buckets = {
-    allUnfulfilled: [],
-    readyToShip: [],
-    atGrading: [],
-    partiallyReady: [],
-    waitingOnRelease: [],
-    completed: [],
-    cancelled: [],
-  };
+  const processedOrders = rawOrders.map((ro) => processOrder(ro, today)).filter(Boolean);
+
+  let displayedOrders = processedOrders;
+  if (!searchQuery.trim()) {
+    if (activeConfig.bucketKey === "readyToShip") {
+      displayedOrders = processedOrders.filter((o) => o.bucket === "readyToShip" && !o.isOnHold);
+    } else if (activeConfig.bucketKey === "atGrading") {
+      displayedOrders = processedOrders.filter((o) => o.cgcActiveInOrder || o.bucket === "atGrading");
+    } else if (activeConfig.bucketKey === "partiallyReady") {
+      displayedOrders = processedOrders.filter((o) => o.bucket === "partiallyReady");
+    } else if (activeConfig.bucketKey === "waitingOnRelease") {
+      displayedOrders = processedOrders.filter((o) => o.bucket === "waitingOnRelease");
+    }
+  }
+
   const pullListItems = [];
-  const allOrdersList = [];
-
-  for (const rawOrder of rawOrders) {
-    const processed = processOrder(rawOrder, today);
-    if (!processed) continue;
-
-    allOrdersList.push(processed);
-
-    if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
-
-    // FEATURE 2: PRINT & COUNT PROTECTION
-    // If order is ON HOLD, exclude it from clean Ready to Ship queue
-    if (processed.bucket === "readyToShip") {
-      if (!processed.isOnHold) {
-        buckets.readyToShip.push(processed);
-      }
-    } else if (buckets[processed.bucket]) {
-      buckets[processed.bucket].push(processed);
-    }
-
-    if (processed.cgcActiveInOrder) {
-      if (!buckets.atGrading.some((o) => o.id === processed.id)) {
-        buckets.atGrading.push(processed);
-      }
-    }
-
-    if (processed.bucket === "partiallyReady") {
-      processed.lineItems
+  processedOrders.forEach((o) => {
+    if (o.bucket === "partiallyReady") {
+      o.lineItems
         .filter((li) => li.isReleased && !li.isAtGrading && li.unfulfilledQuantity > 0)
         .forEach((li) => {
           pullListItems.push({
-            orderId: processed.id,
-            orderName: processed.name,
-            sourceName: processed.sourceName,
-            isOnHold: processed.isOnHold,
+            orderId: o.id,
+            orderName: o.name,
+            sourceName: o.sourceName,
+            isOnHold: o.isOnHold,
             customerName:
-              `${processed.customer?.firstName || ""} ${processed.customer?.lastName || ""}`.trim() ||
-              processed.shippingAddress?.name ||
+              `${o.customer?.firstName || ""} ${o.customer?.lastName || ""}`.trim() ||
+              o.shippingAddress?.name ||
               "Unknown",
             ...li,
           });
         });
     }
-  }
+  });
 
-  const focPullList = buildFocPullList(buckets.waitingOnRelease);
-
-  return {
-    allOrdersGrouped: groupByCustomer(allOrdersList),
-    groups: {
-      allUnfulfilled: groupByCustomer(buckets.allUnfulfilled),
-      readyToShip: groupByCustomer(buckets.readyToShip),
-      atGrading: groupByCustomer(buckets.atGrading),
-      partiallyReady: groupByCustomer(buckets.partiallyReady),
-      waitingOnRelease: groupByCustomer(buckets.waitingOnRelease),
-      completed: groupByCustomer(buckets.completed),
-      cancelled: groupByCustomer(buckets.cancelled),
-    },
-    counts: {
-      allUnfulfilled: buckets.allUnfulfilled.length,
-      readyToShip: buckets.readyToShip.length,
-      atGrading: buckets.atGrading.length,
-      partiallyReady: buckets.partiallyReady.length,
-      waitingOnRelease: buckets.waitingOnRelease.length,
-      completed: buckets.completed.length,
-      cancelled: buckets.cancelled.length,
-      heldOrdersCount: allOrdersList.filter((o) => o.isOnHold).length,
-    },
-    pullListItems: pullListItems.sort((a, b) => (b.daysPastRelease || 0) - (a.daysPastRelease || 0)),
-    focPullList,
-  };
-}
-
-export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
-  const rawOrders = await fetchAllStoreOrdersUnlimited(admin);
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processOrders(rawOrders);
+  const focPullList = buildFocPullList(processedOrders.filter((o) => o.bucket === "waitingOnRelease"));
 
   return jsonResponse({
-    allOrdersGrouped,
-    groups,
-    counts,
-    pullListItems,
+    activeTabId,
+    ordersGrouped: groupByCustomer(displayedOrders),
+    pageInfo,
+    pullListItems: pullListItems.sort((a, b) => (b.daysPastRelease || 0) - (a.daysPastRelease || 0)),
     focPullList,
-    totalOrdersCount: rawOrders.length,
+    totalCountOnPage: displayedOrders.length,
+    heldOrdersCount: displayedOrders.filter((o) => o.isOnHold).length,
   });
 };
 
 /* ------------------------------------------------------------------ */
-/*  3. USER INTERFACE COMPONENTS                                      */
+/*  4. USER INTERFACE COMPONENTS                                      */
 /* ------------------------------------------------------------------ */
 
 const CHANNEL_OPTIONS = [
@@ -648,8 +566,6 @@ const CHANNEL_OPTIONS = [
   { label: "eBay Marketplace", value: "ebay" },
   { label: "Whatnot Live", value: "whatnot" },
 ];
-
-const PAGE_SIZE = 100;
 
 function formatDate(dateString) {
   if (!dateString) return "—";
@@ -696,59 +612,6 @@ function AgingBadge({ agingStatus }) {
     return <Badge tone="warning" icon={AlertTriangleIcon}>1+ Wk Late Aging Flag</Badge>;
   }
   return null;
-}
-
-function BucketBadge({ bucketKey }) {
-  const map = {
-    allUnfulfilled: { tone: "attention", label: "All Unfulfilled Queue" },
-    readyToShip: { tone: "success", label: "Ready to Ship" },
-    atGrading: { tone: "warning", label: "At CGC Grading" },
-    partiallyReady: { tone: "attention", label: "Partially Ready" },
-    waitingOnRelease: { tone: "info", label: "Waiting on Release" },
-    completed: { tone: "complete", label: "Shipped & Completed" },
-    cancelled: { tone: "critical", label: "Cancelled Orders" },
-  };
-  const entry = map[bucketKey];
-  return <Badge tone={entry?.tone}>{entry?.label}</Badge>;
-}
-
-function filterGroupsByChannel(groups, selectedChannels) {
-  if (!selectedChannels || selectedChannels.length === 0) return groups;
-  return groups
-    .map((group) => {
-      const matchingOrders = group.orders.filter((o) => selectedChannels.includes(o.sourceName));
-      if (matchingOrders.length === 0) return null;
-      return { ...group, orders: matchingOrders };
-    })
-    .filter(Boolean);
-}
-
-function filterGroupsByQuery(groups, query) {
-  if (!query) return groups;
-  const rawQ = query.trim().toLowerCase();
-  const cleanQ = rawQ.replace(/^#+/, "").trim();
-  const pureDigitsOnly = cleanQ.replace(/\D/g, "");
-
-  return groups.filter((group) => {
-    const custName = group.customerName.toLowerCase();
-    const custEmail = group.customerEmail.toLowerCase();
-
-    const matchesCustomer = custName.includes(rawQ) || custName.includes(cleanQ) || custEmail.includes(cleanQ);
-
-    const matchesOrder = group.orders.some((o) => {
-      const orderName = (o.name || "").toLowerCase();
-      const orderCleanName = orderName.replace(/^#+/, "").trim();
-      const orderDigits = orderName.replace(/\D/g, "");
-
-      return (
-        orderName.includes(rawQ) ||
-        orderCleanName.includes(cleanQ) ||
-        (pureDigitsOnly.length >= 3 && orderDigits.includes(pureDigitsOnly))
-      );
-    });
-
-    return matchesCustomer || matchesOrder;
-  });
 }
 
 function CustomerSummaryCard({ summary }) {
@@ -877,7 +740,7 @@ function OrderSummaryRow({ order }) {
   );
 }
 
-function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) {
+function BucketIndexTable({ groups, expandedGroups, onToggleGroup }) {
   if (!groups || groups.length === 0) {
     return (
       <Box paddingBlock="800">
@@ -885,7 +748,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           heading="Queue Cleared / No Matching Results"
           image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
         >
-          <p>No matching order records found across the entire store database.</p>
+          <p>No matching order records found in this view.</p>
         </EmptyState>
       </Box>
     );
@@ -967,11 +830,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
                       {group.shippingAddress?.city ? `${group.shippingAddress.city}, ${group.shippingAddress.country}` : "No Address"}
                     </Text>
 
-                    {bucketKey === "cancelled" ? (
-                      <Badge tone="critical">Cancelled</Badge>
-                    ) : (
-                      <AgingBadge agingStatus={group.worstAging} />
-                    )}
+                    <AgingBadge agingStatus={group.worstAging} />
                   </InlineStack>
                 </InlineStack>
 
@@ -1107,7 +966,11 @@ function FocPullListView({ focGroups }) {
 }
 
 export default function FulfillmentDashboard() {
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, totalOrdersCount } = useLoaderData();
+  const { activeTabId, ordersGrouped, pageInfo, pullListItems, focPullList, totalCountOnPage, heldOrdersCount } =
+    useLoaderData();
+
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const handleManualSync = () => {
@@ -1117,21 +980,24 @@ export default function FulfillmentDashboard() {
 
   const b2g1Fetcher = useFetcher();
   const isSyncingB2G1 = b2g1Fetcher.state === "submitting" || b2g1Fetcher.state === "loading";
+  const handleSyncB2G1 = () => b2g1Fetcher.load("/api/sync-b2g1");
 
-  const handleSyncB2G1 = () => {
-    b2g1Fetcher.load("/api/sync-b2g1");
-  };
+  const selectedTab = TAB_CONFIG.findIndex((t) => t.id === activeTabId) !== -1
+    ? TAB_CONFIG.findIndex((t) => t.id === activeTabId)
+    : 0;
 
-  const [selectedTab, setSelectedTab] = useState(0);
   const [channelFilter, setChannelFilter] = useState([]);
-  const [queryValue, setQueryValue] = useState("");
+  const [queryValue, setQueryValue] = useState(searchParams.get("q") || "");
   const [expandedGroups, setExpandedGroups] = useState(new Set());
 
-  const [currentPage, setCurrentPage] = useState(1);
-
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [selectedTab, queryValue, channelFilter]);
+  // Tab switch instantly triggers backend filtered fetch
+  const handleTabSelect = (selectedTabIndex) => {
+    const nextTab = TAB_CONFIG[selectedTabIndex];
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", nextTab.id);
+    params.delete("cursor");
+    navigate(`?${params.toString()}`);
+  };
 
   const onToggleGroup = useCallback((key) => {
     setExpandedGroups((prev) => {
@@ -1142,36 +1008,39 @@ export default function FulfillmentDashboard() {
     });
   }, []);
 
-  const tabs = [
-    { id: "all-unfulfilled", content: "Unfulfilled Orders", badgeCount: counts.allUnfulfilled, bucketKey: "allUnfulfilled" },
-    { id: "ready-to-ship", content: "Ready to Ship", badgeCount: counts.readyToShip, bucketKey: "readyToShip" },
-    { id: "at-grading", content: "At Grading (CGC)", badgeCount: counts.atGrading, bucketKey: "atGrading" },
-    { id: "partially-ready", content: "Partially Ready", badgeCount: counts.partiallyReady, bucketKey: "partiallyReady" },
-    { id: "waiting-on-release", content: "Waiting on Release", badgeCount: counts.waitingOnRelease, bucketKey: "waitingOnRelease" },
-    { id: "completed-shipped", content: "Completed / Shipped", badgeCount: counts.completed, bucketKey: "completed" },
-    { id: "cancelled-orders", content: "Cancelled Orders", badgeCount: counts.cancelled, bucketKey: "cancelled" },
-  ];
+  const handleSearchSubmit = () => {
+    const params = new URLSearchParams(searchParams);
+    if (queryValue.trim()) params.set("q", queryValue.trim());
+    else params.delete("q");
+    params.delete("cursor");
+    navigate(`?${params.toString()}`);
+  };
 
-  const activeBucketKey = tabs[selectedTab].bucketKey;
+  const handleNextPage = () => {
+    if (!pageInfo.hasNextPage || !pageInfo.endCursor) return;
+    const params = new URLSearchParams(searchParams);
+    params.set("cursor", pageInfo.endCursor);
+    navigate(`?${params.toString()}`);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const handleResetPagination = () => {
+    const params = new URLSearchParams(searchParams);
+    params.delete("cursor");
+    navigate(`?${params.toString()}`);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
 
   const filteredGroups = useMemo(() => {
-    const isSearching = Boolean(queryValue.trim());
-    const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
-    const byChannel = filterGroupsByChannel(base, channelFilter);
-    return filterGroupsByQuery(byChannel, queryValue);
-  }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue]);
-
-  useEffect(() => {
-    if (queryValue.trim()) {
-      setExpandedGroups(new Set(filteredGroups.map((r) => r.key)));
-    }
-  }, [queryValue, filteredGroups]);
-
-  const totalPages = Math.ceil(filteredGroups.length / PAGE_SIZE) || 1;
-  const paginatedGroups = useMemo(() => {
-    const start = (currentPage - 1) * PAGE_SIZE;
-    return filteredGroups.slice(start, start + PAGE_SIZE);
-  }, [filteredGroups, currentPage]);
+    if (!channelFilter || channelFilter.length === 0) return ordersGrouped;
+    return ordersGrouped
+      .map((group) => {
+        const matchingOrders = group.orders.filter((o) => channelFilter.includes(o.sourceName));
+        if (matchingOrders.length === 0) return null;
+        return { ...group, orders: matchingOrders };
+      })
+      .filter(Boolean);
+  }, [ordersGrouped, channelFilter]);
 
   const filteredPullListItems = useMemo(() => {
     if (channelFilter.length === 0) return pullListItems;
@@ -1188,7 +1057,7 @@ export default function FulfillmentDashboard() {
     <AppProvider i18n={enTranslations}>
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Total Orders Ingested: ${totalOrdersCount}`}
+        subtitle={`Fast Targeted Queue • Orders in this view: ${totalCountOnPage}`}
         primaryAction={{
           content: "Sync Orders Now",
           icon: RefreshIcon,
@@ -1200,18 +1069,27 @@ export default function FulfillmentDashboard() {
           <Layout.Section>
             <Card padding="0">
               <Tabs
-                tabs={tabs.map((tab) => ({ id: tab.id, content: `${tab.content} (${tab.badgeCount})` }))}
+                tabs={TAB_CONFIG.map((tab) => ({ id: tab.id, content: tab.content }))}
                 selected={selectedTab}
-                onSelect={setSelectedTab}
+                onSelect={handleTabSelect}
               />
               <Box padding="400">
                 <BlockStack gap="400">
                   <Filters
                     queryValue={queryValue}
-                    queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name across ALL tabs..."
+                    queryPlaceholder="Instant Search: Type Order # or Name and press Enter..."
                     onQueryChange={setQueryValue}
-                    onQueryClear={() => setQueryValue("")}
-                    onClearAll={() => { setQueryValue(""); setChannelFilter([]); }}
+                    onQueryClear={() => {
+                      setQueryValue("");
+                      const params = new URLSearchParams(searchParams);
+                      params.delete("q");
+                      navigate(`?${params.toString()}`);
+                    }}
+                    onClearAll={() => {
+                      setQueryValue("");
+                      setChannelFilter([]);
+                      navigate(`?tab=${activeTabId}`);
+                    }}
                     filters={[{
                       key: "channel",
                       label: "Marketplace Channels",
@@ -1231,13 +1109,14 @@ export default function FulfillmentDashboard() {
 
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
-                      <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across all store records.
-                      </Text>
+                      <InlineStack align="space-between" blockAlign="center">
+                        <Text as="p" fontWeight="bold">Active Query: "{queryValue}"</Text>
+                        <Button size="slim" onClick={handleSearchSubmit}>Search Store</Button>
+                      </InlineStack>
                     </Banner>
                   )}
 
-                  {activeBucketKey === "atGrading" && !queryValue.trim() && (
+                  {activeTabId === "at-grading" && (
                     <Banner tone="warning" icon={ClockIcon}>
                       <Text as="p" fontWeight="semibold">CGC Grading Processing Queue</Text>
                       <Text as="p">
@@ -1246,7 +1125,7 @@ export default function FulfillmentDashboard() {
                     </Banner>
                   )}
 
-                  {selectedTab === 3 && !queryValue.trim() && (
+                  {activeTabId === "partially-ready" && (
                     <Banner tone="warning" icon={PackageIcon}>
                       <Text as="p" fontWeight="semibold">Warehouse Extract / Harvest Pull List</Text>
                       <Text as="p">Extract these line items from storage racks immediately. They are physically released but bound inside composite pre-order allocations.</Text>
@@ -1256,7 +1135,7 @@ export default function FulfillmentDashboard() {
                     </Banner>
                   )}
 
-                  {selectedTab === 4 && !queryValue.trim() && (
+                  {activeTabId === "waiting-on-release" && (
                     <BlockStack gap="300">
                       <Banner tone="info" icon={CalendarIcon}>
                         <Text as="p" fontWeight="semibold">FOC Weekly Ordering Pull List</Text>
@@ -1269,45 +1148,34 @@ export default function FulfillmentDashboard() {
                   <Box paddingBlockStart="200">
                     <InlineStack align="space-between" blockAlign="center">
                       <Text as="h3" variant="headingSm" tone="subdued">
-                        Orders in Queue ({filteredGroups.length} Total Customers) — Showing Page {currentPage} of {totalPages}
+                        Showing {filteredGroups.length} Customer Batches
                       </Text>
-                      {filteredGroups.length > PAGE_SIZE && (
-                        <Pagination
-                          hasPrevious={currentPage > 1}
-                          onPrevious={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                          hasNext={currentPage < totalPages}
-                          onNext={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-                        />
-                      )}
+                      <Pagination
+                        hasPrevious={Boolean(searchParams.get("cursor"))}
+                        onPrevious={handleResetPagination}
+                        hasNext={pageInfo.hasNextPage}
+                        onNext={handleNextPage}
+                      />
                     </InlineStack>
 
                     <Box paddingBlockStart="300">
                       <BucketIndexTable
-                        groups={paginatedGroups}
-                        bucketKey={activeBucketKey}
+                        groups={filteredGroups}
                         expandedGroups={expandedGroups}
                         onToggleGroup={onToggleGroup}
                       />
                     </Box>
 
-                    {filteredGroups.length > PAGE_SIZE && (
-                      <Box paddingBlockStart="400">
-                        <InlineStack align="center">
-                          <Pagination
-                            hasPrevious={currentPage > 1}
-                            onPrevious={() => {
-                              setCurrentPage((p) => Math.max(1, p - 1));
-                              window.scrollTo({ top: 0, behavior: 'smooth' });
-                            }}
-                            hasNext={currentPage < totalPages}
-                            onNext={() => {
-                              setCurrentPage((p) => Math.min(totalPages, p + 1));
-                              window.scrollTo({ top: 0, behavior: 'smooth' });
-                            }}
-                          />
-                        </InlineStack>
-                      </Box>
-                    )}
+                    <Box paddingBlockStart="400">
+                      <InlineStack align="center">
+                        <Pagination
+                          hasPrevious={Boolean(searchParams.get("cursor"))}
+                          onPrevious={handleResetPagination}
+                          hasNext={pageInfo.hasNextPage}
+                          onNext={handleNextPage}
+                        />
+                      </InlineStack>
+                    </Box>
                   </Box>
                 </BlockStack>
               </Box>
@@ -1322,39 +1190,15 @@ export default function FulfillmentDashboard() {
                   <Text as="h3" fontWeight="semibold">Realtime Fulfillment Metrics</Text>
                 </InlineStack>
                 <InlineStack align="space-between">
-                  <BucketBadge bucketKey="allUnfulfilled" />
-                  <Text as="span">{counts.allUnfulfilled} Total Pending</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="readyToShip" />
-                  <Text as="span">{counts.readyToShip} Orders Pending</Text>
+                  <Text as="span">Current Batch Count</Text>
+                  <Text as="span" fontWeight="bold">{totalCountOnPage} Orders</Text>
                 </InlineStack>
                 <InlineStack align="space-between">
                   <InlineStack gap="100" blockAlign="center">
                     <Icon source={LockIcon} tone="warning" />
                     <Text as="span" fontWeight="semibold">On Hold Orders</Text>
                   </InlineStack>
-                  <Badge tone="warning">{`${counts.heldOrdersCount || 0} Orders Held`}</Badge>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="atGrading" />
-                  <Text as="span">{counts.atGrading} Slabs at CGC</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="partiallyReady" />
-                  <Text as="span">{counts.partiallyReady} Hybrid Units</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="waitingOnRelease" />
-                  <Text as="span">{counts.waitingOnRelease} Vaulted Holds</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="completed" />
-                  <Text as="span">{counts.completed} Shipped Orders</Text>
-                </InlineStack>
-                <InlineStack align="space-between">
-                  <BucketBadge bucketKey="cancelled" />
-                  <Text as="span">{counts.cancelled} Cancelled Orders</Text>
+                  <Badge tone="warning">{`${heldOrdersCount || 0} Orders Held`}</Badge>
                 </InlineStack>
 
                 {/* --- B2G1 AUTOMATION CONTROL SECTION --- */}
