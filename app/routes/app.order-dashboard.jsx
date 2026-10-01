@@ -34,6 +34,7 @@ import {
   CalendarIcon,
   ClockIcon,
   RefreshIcon,
+  LockIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
@@ -70,8 +71,22 @@ const ALL_STORE_ORDERS_QUERY = `#graphql
           displayFinancialStatus
           tags
           customer {
+            id
             firstName
             lastName
+            tags
+          }
+          fulfillmentOrders(first: 10) {
+            edges {
+              node {
+                id
+                status
+                fulfillmentHolds {
+                  reason
+                  reasonNotes
+                }
+              }
+            }
           }
           email
           shippingAddress {
@@ -119,7 +134,6 @@ async function fetchAllStoreOrdersUnlimited(admin) {
   let hasNextPage = true;
   let pageCount = 0;
 
-  // 250 per call se 10,000 orders tak bina timeout ke fast load honge
   while (hasNextPage && pageCount < 40) {
     pageCount++;
     try {
@@ -282,6 +296,24 @@ function processOrder(rawOrder, today) {
 
   const orderHasCgcRemovalTag = hasCgcRemovalTag(rawOrder.tags);
 
+  const orderTags = Array.isArray(rawOrder.tags) ? rawOrder.tags.map((t) => (t || "").toLowerCase().trim()) : [];
+  const hasOrderShipHoldTag = orderTags.includes("ship-hold");
+
+  const fulfillmentOrders = rawOrder.fulfillmentOrders?.edges ? rawOrder.fulfillmentOrders.edges.map((e) => e.node) : [];
+  const hasFulfillmentHold = fulfillmentOrders.some(
+    (fo) => Array.isArray(fo.fulfillmentHolds) && fo.fulfillmentHolds.length > 0
+  );
+
+  const isOnHold = !isCancelled && !isFullyFulfilled && (hasOrderShipHoldTag || hasFulfillmentHold);
+
+  const customerTags = Array.isArray(rawOrder.customer?.tags)
+    ? rawOrder.customer.tags.map((t) => (t || "").toLowerCase().trim())
+    : [];
+  const customerHasHoldTag = customerTags.includes("ship-hold");
+
+  // Safety Net Flag: Customer has hold tag but this active order misses both the order tag and fulfillment hold
+  const isSafetyNetFlagged = !isCancelled && !isFullyFulfilled && customerHasHoldTag && !isOnHold;
+
   const lineItems = allRawItems.map((li) => {
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = parseSafeDate(releaseDateRaw);
@@ -386,6 +418,9 @@ function processOrder(rawOrder, today) {
     isCancelled,
     cgcActiveInOrder,
     customerKey: buildCustomerKey(rawOrder),
+    isOnHold,
+    isSafetyNetFlagged,
+    customerHasHoldTag,
   };
 }
 
@@ -403,6 +438,34 @@ function groupByCustomer(orders) {
         `${first.customer?.firstName || ""} ${first.customer?.lastName || ""}`.trim() ||
         first.shippingAddress?.name ||
         "Unknown Buyer";
+
+      // Compute Hold Breakdown for this customer
+      let heldOrdersCount = 0;
+      let readyItemsCount = 0;
+      let waitingItemsCount = 0;
+      const targetReleaseDates = [];
+      let hasSafetyFlag = false;
+
+      for (const ord of groupOrders) {
+        if (ord.isOnHold) heldOrdersCount++;
+        if (ord.isSafetyNetFlagged) hasSafetyFlag = true;
+
+        if (ord.hasUnfulfilled && !ord.isCancelled) {
+          for (const li of ord.lineItems) {
+            if (li.unfulfilledQuantity > 0) {
+              if ((li.isReleased && !li.isAtGrading) || (li.isCgc && li.isGradingReturned)) {
+                readyItemsCount += li.unfulfilledQuantity;
+              } else {
+                waitingItemsCount += li.unfulfilledQuantity;
+                if (li.releaseDate) targetReleaseDates.push(li.releaseDate);
+              }
+            }
+          }
+        }
+      }
+
+      const allItemsReady = readyItemsCount > 0 && waitingItemsCount === 0;
+
       return {
         key: first.customerKey,
         customerName,
@@ -410,6 +473,15 @@ function groupByCustomer(orders) {
         shippingAddress: first.shippingAddress,
         orders: groupOrders,
         isMultiOrder: groupOrders.length > 1,
+        hasHold: heldOrdersCount > 0 || first.customerHasHoldTag,
+        hasSafetyFlag,
+        holdSummary: {
+          heldOrdersCount,
+          readyItemsCount,
+          waitingItemsCount,
+          targetReleaseDates: Array.from(new Set(targetReleaseDates)).sort(),
+          allItemsReady,
+        },
         worstAging: groupOrders.reduce((worst, o) => {
           const orderWorst = o.lineItems.reduce((w, li) => {
             if (li.agingStatus === "critical") return "critical";
@@ -423,6 +495,7 @@ function groupByCustomer(orders) {
       };
     })
     .sort((a, b) => {
+      if (a.hasSafetyFlag !== b.hasSafetyFlag) return a.hasSafetyFlag ? -1 : 1;
       if (a.isMultiOrder !== b.isMultiOrder) return a.isMultiOrder ? -1 : 1;
       const rank = { critical: 0, warning: 1, null: 2 };
       return rank[a.worstAging] - rank[b.worstAging];
@@ -498,7 +571,16 @@ function processOrders(rawOrders) {
     allOrdersList.push(processed);
 
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
-    if (buckets[processed.bucket]) buckets[processed.bucket].push(processed);
+
+    // FEATURE 2: PRINT & COUNT PROTECTION
+    // If order is ON HOLD, exclude it from clean Ready to Ship queue
+    if (processed.bucket === "readyToShip") {
+      if (!processed.isOnHold) {
+        buckets.readyToShip.push(processed);
+      }
+    } else if (buckets[processed.bucket]) {
+      buckets[processed.bucket].push(processed);
+    }
 
     if (processed.cgcActiveInOrder) {
       if (!buckets.atGrading.some((o) => o.id === processed.id)) {
@@ -514,6 +596,7 @@ function processOrders(rawOrders) {
             orderId: processed.id,
             orderName: processed.name,
             sourceName: processed.sourceName,
+            isOnHold: processed.isOnHold,
             customerName:
               `${processed.customer?.firstName || ""} ${processed.customer?.lastName || ""}`.trim() ||
               processed.shippingAddress?.name ||
@@ -545,6 +628,7 @@ function processOrders(rawOrders) {
       waitingOnRelease: buckets.waitingOnRelease.length,
       completed: buckets.completed.length,
       cancelled: buckets.cancelled.length,
+      heldOrdersCount: allOrdersList.filter((o) => o.isOnHold).length,
     },
     pullListItems: pullListItems.sort((a, b) => (b.daysPastRelease || 0) - (a.daysPastRelease || 0)),
     focPullList,
@@ -678,6 +762,42 @@ function filterGroupsByQuery(groups, query) {
   });
 }
 
+function CustomerSummaryCard({ summary }) {
+  const { heldOrdersCount, readyItemsCount, waitingItemsCount, targetReleaseDates, allItemsReady } = summary;
+
+  return (
+    <Box padding="300" background="bg-surface-secondary-active" borderRadius="200">
+      <BlockStack gap="200">
+        <InlineStack align="space-between" blockAlign="center">
+          <InlineStack gap="200" blockAlign="center">
+            <Icon source={LockIcon} tone="warning" />
+            <Text as="span" fontWeight="bold">Customer Hold Summary Breakdown</Text>
+          </InlineStack>
+          <InlineStack gap="200">
+            <Badge tone="warning">{`${heldOrdersCount} Order(s) on Hold`}</Badge>
+            <Badge tone="success">{`${readyItemsCount} Units Ready`}</Badge>
+            <Badge tone="info">{`${waitingItemsCount} Units Waiting`}</Badge>
+          </InlineStack>
+        </InlineStack>
+
+        {targetReleaseDates.length > 0 && (
+          <Text as="p" variant="bodySm" tone="subdued">
+            Target Release Dates: {targetReleaseDates.map((d) => formatDate(d)).join(", ")}
+          </Text>
+        )}
+
+        {allItemsReady && (
+          <Banner tone="success">
+            <Text as="p" fontWeight="bold">
+              Ready to Release Alert: All pre-order items for this customer have arrived and are ready to ship!
+            </Text>
+          </Banner>
+        )}
+      </BlockStack>
+    </Box>
+  );
+}
+
 function OrderSummaryRow({ order }) {
   const itemCount = order.lineItems.reduce((sum, li) => sum + li.quantity, 0);
   const worstAging = order.lineItems.reduce((worst, li) => {
@@ -689,6 +809,14 @@ function OrderSummaryRow({ order }) {
   return (
     <Box padding="300" background="bg-surface-secondary" borderRadius="200">
       <BlockStack gap="200">
+        {order.isSafetyNetFlagged && (
+          <Banner tone="critical" icon={AlertTriangleIcon}>
+            <Text as="p" fontWeight="bold">
+              Safety Net Flag: Customer profile is marked with "ship-hold", but this order lacks the order tag or active fulfillment hold!
+            </Text>
+          </Banner>
+        )}
+
         <InlineStack align="space-between" blockAlign="center">
           <InlineStack gap="300" blockAlign="center">
             <Text as="span" fontWeight="bold">{order.name}</Text>
@@ -699,9 +827,22 @@ function OrderSummaryRow({ order }) {
                 Cancelled ({formatDate(order.cancelledAt)})
               </Badge>
             )}
+            {order.isOnHold && (
+              <Badge tone="warning" icon={LockIcon}>
+                ON HOLD
+              </Badge>
+            )}
             <Text as="span" tone="subdued">{itemCount} Item(s)</Text>
           </InlineStack>
-          <AgingBadge agingStatus={worstAging} />
+          
+          <InlineStack gap="200" blockAlign="center">
+            <AgingBadge agingStatus={worstAging} />
+            <Tooltip content={order.isOnHold ? "Action locked: Order is ON HOLD" : "Generate Pick Slip & Pack"}>
+              <Button size="slim" disabled={order.isOnHold || order.isCancelled}>
+                {order.isOnHold ? "Hold Locked" : "Print Pick Slip"}
+              </Button>
+            </Tooltip>
+          </InlineStack>
         </InlineStack>
 
         <Divider />
@@ -731,7 +872,9 @@ function OrderSummaryRow({ order }) {
                     {li.isAtGrading && <Badge tone="warning">At Grading (60-90d)</Badge>}
                     {li.unfulfilledQuantity === 0 && <Badge tone="success" icon={CheckCircleIcon}>Shipped / Fulfilled</Badge>}
                     {li.unfulfilledQuantity > 0 && li.isReleased && !li.isAtGrading && (
-                      <Badge tone="attention">Pending Pickup</Badge>
+                      <Badge tone={order.isOnHold ? "warning" : "attention"}>
+                        {order.isOnHold ? "Held (Ready)" : "Pending Pickup"}
+                      </Badge>
                     )}
                   </>
                 )}
@@ -771,7 +914,13 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
             key={group.key}
             style={{
               borderRadius: "8px",
-              border: isEbayCustomer ? "2px solid #0064D2" : "1px solid #E1E3E5",
+              border: group.hasSafetyFlag
+                ? "2px solid #D82C0D"
+                : group.hasHold
+                ? "2px solid #E4A200"
+                : isEbayCustomer
+                ? "2px solid #0064D2"
+                : "1px solid #E1E3E5",
               boxShadow: isEbayCustomer ? "0 1px 6px rgba(0, 100, 210, 0.15)" : "none",
             }}
           >
@@ -787,6 +936,16 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
                     <BlockStack gap="050">
                       <InlineStack gap="200" blockAlign="center">
                         <Text as="span" fontWeight="bold" variant="bodyMd">{group.customerName}</Text>
+                        {group.hasHold && (
+                          <Badge tone="warning" icon={LockIcon}>
+                            HOLD ACCOUNT
+                          </Badge>
+                        )}
+                        {group.hasSafetyFlag && (
+                          <Badge tone="critical" icon={AlertTriangleIcon}>
+                            SAFETY FLAG
+                          </Badge>
+                        )}
                         {isEbayCustomer && (
                           <span
                             style={{
@@ -827,6 +986,10 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
                   </InlineStack>
                 </InlineStack>
 
+                {group.hasHold && (
+                  <CustomerSummaryCard summary={group.holdSummary} />
+                )}
+
                 {isExpanded && (
                   <Box paddingBlockStart="200">
                     <BlockStack gap="200">
@@ -860,6 +1023,7 @@ function PullListTable({ items }) {
         { title: "Order ID" },
         { title: "Consignee" },
         { title: "Marketplace Source" },
+        { title: "Hold Status" },
         { title: "Release Target Date" },
         { title: "Aging Index" },
       ]}
@@ -873,6 +1037,9 @@ function PullListTable({ items }) {
           <IndexTable.Cell>{item.orderName}</IndexTable.Cell>
           <IndexTable.Cell>{item.customerName}</IndexTable.Cell>
           <IndexTable.Cell><ChannelBadge sourceName={item.sourceName} /></IndexTable.Cell>
+          <IndexTable.Cell>
+            {item.isOnHold ? <Badge tone="warning" icon={LockIcon}>Held</Badge> : <Badge tone="success">Active</Badge>}
+          </IndexTable.Cell>
           <IndexTable.Cell>{formatDate(item.releaseDate)}</IndexTable.Cell>
           <IndexTable.Cell><AgingBadge agingStatus={item.agingStatus} /></IndexTable.Cell>
         </IndexTable.Row>
@@ -1172,6 +1339,13 @@ export default function FulfillmentDashboard() {
                 <InlineStack align="space-between">
                   <BucketBadge bucketKey="readyToShip" />
                   <Text as="span">{counts.readyToShip} Orders Pending</Text>
+                </InlineStack>
+                <InlineStack align="space-between">
+                  <InlineStack gap="100" blockAlign="center">
+                    <Icon source={LockIcon} tone="warning" />
+                    <Text as="span" fontWeight="semibold">On Hold Orders</Text>
+                  </InlineStack>
+                  <Badge tone="warning">{`${counts.heldOrdersCount || 0} Orders Held`}</Badge>
                 </InlineStack>
                 <InlineStack align="space-between">
                   <BucketBadge bucketKey="atGrading" />
