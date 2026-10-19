@@ -21,6 +21,8 @@ import {
   Divider,
   Tooltip,
   Pagination,
+  Select,
+  Collapsible,
 } from "@shopify/polaris";
 import enTranslations from "@shopify/polaris/locales/en.json";
 import {
@@ -35,6 +37,7 @@ import {
   ClockIcon,
   RefreshIcon,
   LockIcon,
+  FilterIcon,
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 
@@ -120,18 +123,18 @@ async function fetchAllStoreOrdersUnlimited(admin) {
   const seenIds = new Set();
   let cursor = null;
   let hasNextPage = true;
-  let pageCount = 0;
+  let consecutiveErrors = 0;
 
-  // 250 per call se maximum orders fast load honge without hitting nested cost limits
-  while (hasNextPage && pageCount < 40) {
-    pageCount++;
+  // Saare store orders un-capped recursive loop se load honge
+  while (hasNextPage && consecutiveErrors < 5) {
     try {
       const response = await admin.graphql(ALL_STORE_ORDERS_QUERY, {
         variables: { cursor },
       });
 
       if (response.status === 429) {
-        await delay(1500);
+        await delay(2000);
+        consecutiveErrors++;
         continue;
       }
 
@@ -143,7 +146,8 @@ async function fetchAllStoreOrdersUnlimited(admin) {
           (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
         );
         if (isThrottled) {
-          await delay(1500);
+          await delay(2000);
+          consecutiveErrors++;
           continue;
         }
         break;
@@ -161,10 +165,12 @@ async function fetchAllStoreOrdersUnlimited(admin) {
 
       hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
       cursor = ordersData.pageInfo?.endCursor || null;
-      await delay(30);
+      consecutiveErrors = 0;
+      await delay(50);
     } catch (err) {
       console.error("Fetch Loop Error:", err);
-      break;
+      consecutiveErrors++;
+      await delay(1000);
     }
   }
 
@@ -286,34 +292,24 @@ function processOrder(rawOrder, today) {
 
   const orderHasCgcRemovalTag = hasCgcRemovalTag(rawOrder.tags);
 
-  // Check Order Tags
   const orderTags = Array.isArray(rawOrder.tags) ? rawOrder.tags.map((t) => (t || "").toLowerCase().trim()) : [];
   const hasOrderShipHoldTag = orderTags.some((t) => t === "ship-hold" || t === "hold" || t.includes("ship-hold"));
-
-  // Check Shopify Native Fulfillment Hold
   const hasNativeFulfillmentHold = rawOrder.displayFulfillmentStatus === "ON_HOLD";
-
   const isOnHold = !isCancelled && !isFullyFulfilled && (hasOrderShipHoldTag || hasNativeFulfillmentHold);
 
-  // Check Customer Profile Tags
   const customerTags = Array.isArray(rawOrder.customer?.tags)
     ? rawOrder.customer.tags.map((t) => (t || "").toLowerCase().trim())
     : [];
   const customerHasHoldTag = customerTags.some((t) => t === "ship-hold" || t.includes("ship-hold"));
-
-  // Safety Net Flag: Customer profile is marked with ship-hold, but this active order lacks tag & hold status
   const isSafetyNetFlagged = !isCancelled && !isFullyFulfilled && customerHasHoldTag && !isOnHold;
 
   const lineItems = allRawItems.map((li) => {
     const releaseDateRaw = li.product?.metafield?.value || null;
     const releaseDate = parseSafeDate(releaseDateRaw);
-
     const isReleased = !releaseDate || releaseDate.getTime() <= today.getTime();
-
     const focDateRaw = extractFocDate(li.product?.tags, li.product?.focMetafield?.value);
     const isCgc = isCgcItem(li);
     const isReturned = orderHasCgcRemovalTag || hasCgcRemovalTag(rawOrder.tags, li.id);
-
     const isAtGrading = isCgc && !isReturned;
 
     let estimatedGradingReadyDate = null;
@@ -423,6 +419,8 @@ function groupByCustomer(orders) {
 
   return Array.from(map.values())
     .map((groupOrders) => {
+      // Individual customer ke orders ko hamesha newest to oldest sort rakhein
+      groupOrders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
       const first = groupOrders[0];
       const customerName =
         `${first.customer?.firstName || ""} ${first.customer?.lastName || ""}`.trim() ||
@@ -454,6 +452,15 @@ function groupByCustomer(orders) {
       }
 
       const allItemsReady = readyItemsCount > 0 && waitingItemsCount === 0;
+      const latestOrderDate = groupOrders.reduce((latest, o) => {
+        const d = new Date(o.createdAt).getTime();
+        return d > latest ? d : latest;
+      }, 0);
+
+      const oldestOrderDate = groupOrders.reduce((oldest, o) => {
+        const d = new Date(o.createdAt).getTime();
+        return oldest === 0 || d < oldest ? d : oldest;
+      }, 0);
 
       return {
         key: first.customerKey,
@@ -464,6 +471,8 @@ function groupByCustomer(orders) {
         isMultiOrder: groupOrders.length > 1,
         hasHold: heldOrdersCount > 0 || first.customerHasHoldTag,
         hasSafetyFlag,
+        latestOrderDate,
+        oldestOrderDate,
         holdSummary: {
           heldOrdersCount,
           readyItemsCount,
@@ -544,7 +553,7 @@ function processOrders(rawOrders) {
   const buckets = {
     allUnfulfilled: [],
     readyToShip: [],
-    onHold: [], // Dedicated On-Hold Bucket
+    onHold: [],
     atGrading: [],
     partiallyReady: [],
     waitingOnRelease: [],
@@ -562,13 +571,10 @@ function processOrders(rawOrders) {
 
     if (processed.hasUnfulfilled) buckets.allUnfulfilled.push(processed);
 
-    // On-Hold Orders ko alag bucket mein track karte hain
     if (processed.isOnHold) {
       buckets.onHold.push(processed);
     }
 
-    // FEATURE 2: PRINT & COUNT PROTECTION
-    // If order is ON HOLD, exclude it from clean Ready to Ship queue
     if (processed.bucket === "readyToShip") {
       if (!processed.isOnHold) {
         buckets.readyToShip.push(processed);
@@ -609,7 +615,7 @@ function processOrders(rawOrders) {
     groups: {
       allUnfulfilled: groupByCustomer(buckets.allUnfulfilled),
       readyToShip: groupByCustomer(buckets.readyToShip),
-      onHold: groupByCustomer(buckets.onHold), // Dedicated On-Hold Tab Groups
+      onHold: groupByCustomer(buckets.onHold),
       atGrading: groupByCustomer(buckets.atGrading),
       partiallyReady: groupByCustomer(buckets.partiallyReady),
       waitingOnRelease: groupByCustomer(buckets.waitingOnRelease),
@@ -619,7 +625,7 @@ function processOrders(rawOrders) {
     counts: {
       allUnfulfilled: buckets.allUnfulfilled.length,
       readyToShip: buckets.readyToShip.length,
-      onHold: buckets.onHold.length, // Dedicated On-Hold Tab Count
+      onHold: buckets.onHold.length,
       atGrading: buckets.atGrading.length,
       partiallyReady: buckets.partiallyReady.length,
       waitingOnRelease: buckets.waitingOnRelease.length,
@@ -657,7 +663,13 @@ const CHANNEL_OPTIONS = [
   { label: "Whatnot Live", value: "whatnot" },
 ];
 
-const PAGE_SIZE = 100;
+const SORT_OPTIONS = [
+  { label: "Order Date: Oldest First (Priority)", value: "date_asc" },
+  { label: "Order Date: Newest First", value: "date_desc" },
+  { label: "Default / Urgency Priority", value: "default" },
+];
+
+const PAGE_SIZE = 50;
 
 function formatDate(dateString) {
   if (!dateString) return "—";
@@ -850,6 +862,7 @@ function OrderSummaryRow({ order }) {
             <InlineStack key={li.id} align="space-between">
               <Text as="span">
                 <Text as="span" fontWeight="bold">{li.unfulfilledQuantity}x</Text> of {li.quantity}x {li.title} {li.variantTitle ? ` — ${li.variantTitle}` : ""}
+                {li.sku && <Text as="span" tone="subdued"> (SKU: {li.sku})</Text>}
               </Text>
               <InlineStack gap="200">
                 {li.isCgc && <Badge tone="warning">CGC Slab</Badge>}
@@ -1133,14 +1146,17 @@ export default function FulfillmentDashboard() {
 
   const [selectedTab, setSelectedTab] = useState(0);
   const [channelFilter, setChannelFilter] = useState([]);
+  const [sortOrder, setSortOrder] = useState("default");
+  const [isFiltersFolded, setIsFiltersFolded] = useState(true); // Default folded/closed
   const [queryValue, setQueryValue] = useState("");
   const [expandedGroups, setExpandedGroups] = useState(new Set());
 
   const [currentPage, setCurrentPage] = useState(1);
 
+  // Jab bhi tab ya filters change hon, page 1 par reset karein
   useEffect(() => {
     setCurrentPage(1);
-  }, [selectedTab, queryValue, channelFilter]);
+  }, [selectedTab, queryValue, channelFilter, sortOrder]);
 
   const onToggleGroup = useCallback((key) => {
     setExpandedGroups((prev) => {
@@ -1151,7 +1167,6 @@ export default function FulfillmentDashboard() {
     });
   }, []);
 
-  // Dedicated "On Hold Orders" tab added with its live badge count
   const tabs = [
     { id: "all-unfulfilled", content: "Unfulfilled Orders", badgeCount: counts.allUnfulfilled, bucketKey: "allUnfulfilled" },
     { id: "ready-to-ship", content: "Ready to Ship", badgeCount: counts.readyToShip, bucketKey: "readyToShip" },
@@ -1165,12 +1180,28 @@ export default function FulfillmentDashboard() {
 
   const activeBucketKey = tabs[selectedTab].bucketKey;
 
+  // Sorting and Filtering Engine
   const filteredGroups = useMemo(() => {
     const isSearching = Boolean(queryValue.trim());
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
     const byChannel = filterGroupsByChannel(base, channelFilter);
-    return filterGroupsByQuery(byChannel, queryValue);
-  }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue]);
+    const result = filterGroupsByQuery(byChannel, queryValue);
+
+    // Apply Sorting (Oldest first solve karta hai Jim Adams ki concern ko)
+    return [...result].sort((a, b) => {
+      if (sortOrder === "date_asc") {
+        return (a.oldestOrderDate || 0) - (b.oldestOrderDate || 0);
+      }
+      if (sortOrder === "date_desc") {
+        return (b.latestOrderDate || 0) - (a.latestOrderDate || 0);
+      }
+      // Default: Safety flag first -> Hold -> Multi order -> Aging urgency
+      if (a.hasSafetyFlag !== b.hasSafetyFlag) return a.hasSafetyFlag ? -1 : 1;
+      if (a.isMultiOrder !== b.isMultiOrder) return a.isMultiOrder ? -1 : 1;
+      const rank = { critical: 0, warning: 1, null: 2 };
+      return rank[a.worstAging] - rank[b.worstAging];
+    });
+  }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue, sortOrder]);
 
   useEffect(() => {
     if (queryValue.trim()) {
@@ -1189,11 +1220,7 @@ export default function FulfillmentDashboard() {
     return pullListItems.filter((item) => channelFilter.includes(item.sourceName));
   }, [pullListItems, channelFilter]);
 
-  const appliedFilters = channelFilter.length > 0 ? [{
-    key: "channel",
-    label: `Channel Filters: ${channelFilter.map((c) => CHANNEL_OPTIONS.find((o) => o.value === c)?.label).join(", ")}`,
-    onRemove: () => setChannelFilter([]),
-  }] : [];
+  const activeFiltersCount = (channelFilter.length > 0 ? 1 : 0) + (sortOrder !== "default" ? 1 : 0);
 
   return (
     <AppProvider i18n={enTranslations}>
@@ -1213,32 +1240,86 @@ export default function FulfillmentDashboard() {
               <Tabs
                 tabs={tabs.map((tab) => ({ id: tab.id, content: `${tab.content} (${tab.badgeCount})` }))}
                 selected={selectedTab}
-                onSelect={setSelectedTab}
+                onSelect={(idx) => {
+                  setSelectedTab(idx);
+                  // CGC tab pe switch hone par automatically Oldest First set kar dega taake koi order miss na ho
+                  if (tabs[idx].bucketKey === "atGrading") {
+                    setSortOrder("date_asc");
+                  }
+                }}
               />
               <Box padding="400">
                 <BlockStack gap="400">
-                  <Filters
-                    queryValue={queryValue}
-                    queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name across ALL tabs..."
-                    onQueryChange={setQueryValue}
-                    onQueryClear={() => setQueryValue("")}
-                    onClearAll={() => { setQueryValue(""); setChannelFilter([]); }}
-                    filters={[{
-                      key: "channel",
-                      label: "Marketplace Channels",
-                      filter: (
-                        <ChoiceList
-                          title="Sales channel"
-                          titleHidden
-                          choices={CHANNEL_OPTIONS}
-                          selected={channelFilter}
-                          onChange={setChannelFilter}
-                          allowMultiple
+                  {/* Search and Folded Filter Bar */}
+                  <BlockStack gap="200">
+                    <InlineStack gap="300" align="space-between" blockAlign="center">
+                      <div style={{ flex: 1 }}>
+                        <Filters
+                          queryValue={queryValue}
+                          queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name..."
+                          onQueryChange={setQueryValue}
+                          onQueryClear={() => setQueryValue("")}
+                          onClearAll={() => {
+                            setQueryValue("");
+                            setChannelFilter([]);
+                            setSortOrder("default");
+                          }}
+                          filters={[]}
                         />
-                      ),
-                    }]}
-                    appliedFilters={appliedFilters}
-                  />
+                      </div>
+                      <Button
+                        icon={FilterIcon}
+                        onClick={() => setIsFiltersFolded((prev) => !prev)}
+                        tone={activeFiltersCount > 0 ? "critical" : undefined}
+                      >
+                        {isFiltersFolded ? "Open Filters" : "Hide Filters"} {activeFiltersCount > 0 && `(${activeFiltersCount})`}
+                      </Button>
+                    </InlineStack>
+
+                    {/* FOLDABLE FILTER SECTION */}
+                    <Collapsible
+                      open={!isFiltersFolded}
+                      id="order-manager-filters-collapsible"
+                      transition={{ duration: "150ms", timingFunction: "ease-in-out" }}
+                    >
+                      <Box padding="300" background="bg-surface-secondary" borderRadius="200">
+                        <InlineStack gap="600" blockAlign="start" wrap>
+                          <div style={{ minWidth: "200px" }}>
+                            <Select
+                              label="Sort Orders By"
+                              options={SORT_OPTIONS}
+                              value={sortOrder}
+                              onChange={setSortOrder}
+                              helpText={activeBucketKey === "atGrading" ? "Client recommends Oldest First for CGC." : undefined}
+                            />
+                          </div>
+                          <div style={{ minWidth: "220px" }}>
+                            <ChoiceList
+                              title="Sales Channel"
+                              choices={CHANNEL_OPTIONS}
+                              selected={channelFilter}
+                              onChange={setChannelFilter}
+                              allowMultiple
+                            />
+                          </div>
+                          {(channelFilter.length > 0 || sortOrder !== "default") && (
+                            <div style={{ alignSelf: "flex-end" }}>
+                              <Button
+                                variant="plain"
+                                tone="critical"
+                                onClick={() => {
+                                  setChannelFilter([]);
+                                  setSortOrder("default");
+                                }}
+                              >
+                                Reset Filters
+                              </Button>
+                            </div>
+                          )}
+                        </InlineStack>
+                      </Box>
+                    </Collapsible>
+                  </BlockStack>
 
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
@@ -1252,7 +1333,7 @@ export default function FulfillmentDashboard() {
                     <Banner tone="warning" icon={LockIcon}>
                       <Text as="p" fontWeight="semibold">Fulfillment Hold Queue</Text>
                       <Text as="p">
-                        Yeh saare orders <code>ship-hold</code> tag ya native Shopify fulfillment hold par hain. Hold release hone tak inka batch shipping aur pick slip generation locked rahega.
+                        All orders tagged with <code>ship-hold</code> or under active native fulfillment holds. Batch printing locked.
                       </Text>
                     </Banner>
                   )}
@@ -1261,7 +1342,7 @@ export default function FulfillmentDashboard() {
                     <Banner tone="warning" icon={ClockIcon}>
                       <Text as="p" fontWeight="semibold">CGC Grading Processing Queue</Text>
                       <Text as="p">
-                        All orders containing CGC items are tracked here from placement until marked fulfilled or tagged with <code>cgc-returned</code> / <code>cgc-processed</code>.
+                        Currently tracking active CGC submissions. Sorted by <b>{sortOrder === "date_asc" ? "Oldest First" : sortOrder === "date_desc" ? "Newest First" : "Urgency"}</b> to prevent any returned book from being overlooked.
                       </Text>
                     </Banner>
                   )}
@@ -1289,7 +1370,7 @@ export default function FulfillmentDashboard() {
                   <Box paddingBlockStart="200">
                     <InlineStack align="space-between" blockAlign="center">
                       <Text as="h3" variant="headingSm" tone="subdued">
-                        Orders in Queue ({filteredGroups.length} Total Customers) — Showing Page {currentPage} of {totalPages}
+                        Orders in Queue ({filteredGroups.length} Customers) — Showing Page {currentPage} of {totalPages}
                       </Text>
                       {filteredGroups.length > PAGE_SIZE && (
                         <Pagination
@@ -1317,12 +1398,12 @@ export default function FulfillmentDashboard() {
                             hasPrevious={currentPage > 1}
                             onPrevious={() => {
                               setCurrentPage((p) => Math.max(1, p - 1));
-                              window.scrollTo({ top: 0, behavior: 'smooth' });
+                              window.scrollTo({ top: 0, behavior: "smooth" });
                             }}
                             hasNext={currentPage < totalPages}
                             onNext={() => {
                               setCurrentPage((p) => Math.min(totalPages, p + 1));
-                              window.scrollTo({ top: 0, behavior: 'smooth' });
+                              window.scrollTo({ top: 0, behavior: "smooth" });
                             }}
                           />
                         </InlineStack>
@@ -1377,7 +1458,6 @@ export default function FulfillmentDashboard() {
                   <Text as="span">{counts.cancelled} Cancelled Orders</Text>
                 </InlineStack>
 
-                {/* --- B2G1 AUTOMATION CONTROL SECTION --- */}
                 <Divider />
                 <BlockStack gap="200">
                   <Text as="h4" variant="headingSm" fontWeight="semibold">
@@ -1412,8 +1492,6 @@ export default function FulfillmentDashboard() {
                     Scans books older than 3 months (metafield: custom.release_date) and syncs eligible tags.
                   </Text>
                 </BlockStack>
-                {/* --- END B2G1 CONTROL SECTION --- */}
-
               </BlockStack>
             </Card>
           </Layout.Section>
