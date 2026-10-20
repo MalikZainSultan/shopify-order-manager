@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useCallback, useEffect } from "react";
+import React, { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { useLoaderData, useFetcher } from "react-router";
 import {
   AppProvider,
@@ -20,9 +20,9 @@ import {
   EmptyState,
   Divider,
   Tooltip,
-  Pagination,
   Select,
   Collapsible,
+  Spinner,
 } from "@shopify/polaris";
 import enTranslations from "@shopify/polaris/locales/en.json";
 import {
@@ -48,7 +48,7 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED RECURSIVE STORE FETCHING (MAX 250 PER PAGE)          */
+/*  1. UNLIMITED RECURSIVE STORE FETCHING                             */
 /* ------------------------------------------------------------------ */
 
 const ALL_STORE_ORDERS_QUERY = `#graphql
@@ -123,10 +123,9 @@ async function fetchAllStoreOrdersUnlimited(admin) {
   const seenIds = new Set();
   let cursor = null;
   let hasNextPage = true;
-  let consecutiveErrors = 0;
+  let retryCount = 0;
 
-  // Saare store orders un-capped recursive loop se load honge
-  while (hasNextPage && consecutiveErrors < 5) {
+  while (hasNextPage && retryCount < 5) {
     try {
       const response = await admin.graphql(ALL_STORE_ORDERS_QUERY, {
         variables: { cursor },
@@ -134,7 +133,7 @@ async function fetchAllStoreOrdersUnlimited(admin) {
 
       if (response.status === 429) {
         await delay(2000);
-        consecutiveErrors++;
+        retryCount++;
         continue;
       }
 
@@ -147,7 +146,7 @@ async function fetchAllStoreOrdersUnlimited(admin) {
         );
         if (isThrottled) {
           await delay(2000);
-          consecutiveErrors++;
+          retryCount++;
           continue;
         }
         break;
@@ -165,11 +164,11 @@ async function fetchAllStoreOrdersUnlimited(admin) {
 
       hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
       cursor = ordersData.pageInfo?.endCursor || null;
-      consecutiveErrors = 0;
-      await delay(50);
+      retryCount = 0;
+      await delay(40);
     } catch (err) {
       console.error("Fetch Loop Error:", err);
-      consecutiveErrors++;
+      retryCount++;
       await delay(1000);
     }
   }
@@ -419,7 +418,6 @@ function groupByCustomer(orders) {
 
   return Array.from(map.values())
     .map((groupOrders) => {
-      // Individual customer ke orders ko hamesha newest to oldest sort rakhein
       groupOrders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
       const first = groupOrders[0];
       const customerName =
@@ -654,7 +652,7 @@ export const loader = async ({ request }) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  3. USER INTERFACE COMPONENTS                                      */
+/*  3. USER INTERFACE COMPONENTS & CHUNK RENDERERS                   */
 /* ------------------------------------------------------------------ */
 
 const CHANNEL_OPTIONS = [
@@ -669,7 +667,7 @@ const SORT_OPTIONS = [
   { label: "Default / Urgency Priority", value: "default" },
 ];
 
-const PAGE_SIZE = 50;
+const CHUNK_SIZE = 50; // Scroll par 50 50 items load honge
 
 function formatDate(dateString) {
   if (!dateString) return "—";
@@ -907,7 +905,7 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
           heading="Queue Cleared / No Matching Results"
           image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
         >
-          <p>No matching order records found across the entire store database.</p>
+          <p>No matching order records found across the database.</p>
         </EmptyState>
       </Box>
     );
@@ -1019,43 +1017,94 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
   );
 }
 
+/* ------------------------------------------------------------------ */
+/*  4. PRODUCT HARVEST PULL LIST WITH SCROLL CHUNKING (50 PER LOAD)   */
+/* ------------------------------------------------------------------ */
+
 function PullListTable({ items }) {
+  const [visibleItemsCount, setVisibleItemsCount] = useState(CHUNK_SIZE);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const sentinelRef = useRef(null);
+
+  useEffect(() => {
+    setVisibleItemsCount(CHUNK_SIZE);
+  }, [items]);
+
+  // Infinite Scroll Trigger via IntersectionObserver
+  useEffect(() => {
+    if (!sentinelRef.current) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting && visibleItemsCount < items.length && !isLoadingMore) {
+        setIsLoadingMore(true);
+        setTimeout(() => {
+          setVisibleItemsCount((prev) => Math.min(prev + CHUNK_SIZE, items.length));
+          setIsLoadingMore(false);
+        }, 150);
+      }
+    }, { rootMargin: "200px" });
+
+    observer.observe(sentinelRef.current);
+    return () => observer.disconnect();
+  }, [visibleItemsCount, items.length, isLoadingMore]);
+
   if (items.length === 0) {
     return <Banner tone="success">Harvest Complete — All partial items cleared.</Banner>;
   }
 
+  const chunkedItems = items.slice(0, visibleItemsCount);
+
   return (
-    <IndexTable
-      resourceName={{ singular: "item", plural: "items" }}
-      itemCount={items.length}
-      selectable={false}
-      headings={[
-        { title: "Physical Product Component" },
-        { title: "Order ID" },
-        { title: "Consignee" },
-        { title: "Marketplace Source" },
-        { title: "Hold Status" },
-        { title: "Release Target Date" },
-        { title: "Aging Index" },
-      ]}
-    >
-      {items.map((item, index) => (
-        <IndexTable.Row id={`${item.orderId}-${item.id}`} key={`${item.orderId}-${item.id}`} position={index}>
-          <IndexTable.Cell>
-            <Text as="span" fontWeight="semibold">{item.unfulfilledQuantity}x {item.title}</Text>
-            {item.variantTitle && <Text as="span" tone="subdued"> — {item.variantTitle}</Text>}
-          </IndexTable.Cell>
-          <IndexTable.Cell>{item.orderName}</IndexTable.Cell>
-          <IndexTable.Cell>{item.customerName}</IndexTable.Cell>
-          <IndexTable.Cell><ChannelBadge sourceName={item.sourceName} /></IndexTable.Cell>
-          <IndexTable.Cell>
-            {item.isOnHold ? <Badge tone="warning" icon={LockIcon}>Held</Badge> : <Badge tone="success">Active</Badge>}
-          </IndexTable.Cell>
-          <IndexTable.Cell>{formatDate(item.releaseDate)}</IndexTable.Cell>
-          <IndexTable.Cell><AgingBadge agingStatus={item.agingStatus} /></IndexTable.Cell>
-        </IndexTable.Row>
-      ))}
-    </IndexTable>
+    <BlockStack gap="300">
+      <IndexTable
+        resourceName={{ singular: "item", plural: "items" }}
+        itemCount={chunkedItems.length}
+        selectable={false}
+        headings={[
+          { title: "Physical Product Component" },
+          { title: "Order ID" },
+          { title: "Consignee" },
+          { title: "Marketplace Source" },
+          { title: "Hold Status" },
+          { title: "Release Target Date" },
+          { title: "Aging Index" },
+        ]}
+      >
+        {chunkedItems.map((item, index) => (
+          <IndexTable.Row id={`${item.orderId}-${item.id}`} key={`${item.orderId}-${item.id}`} position={index}>
+            <IndexTable.Cell>
+              <Text as="span" fontWeight="semibold">{item.unfulfilledQuantity}x {item.title}</Text>
+              {item.variantTitle && <Text as="span" tone="subdued"> — {item.variantTitle}</Text>}
+              {item.sku && <Text as="span" tone="subdued"> (SKU: {item.sku})</Text>}
+            </IndexTable.Cell>
+            <IndexTable.Cell>{item.orderName}</IndexTable.Cell>
+            <IndexTable.Cell>{item.customerName}</IndexTable.Cell>
+            <IndexTable.Cell><ChannelBadge sourceName={item.sourceName} /></IndexTable.Cell>
+            <IndexTable.Cell>
+              {item.isOnHold ? <Badge tone="warning" icon={LockIcon}>Held</Badge> : <Badge tone="success">Active</Badge>}
+            </IndexTable.Cell>
+            <IndexTable.Cell>{formatDate(item.releaseDate)}</IndexTable.Cell>
+            <IndexTable.Cell><AgingBadge agingStatus={item.agingStatus} /></IndexTable.Cell>
+          </IndexTable.Row>
+        ))}
+      </IndexTable>
+
+      <div ref={sentinelRef} style={{ height: "20px" }} />
+
+      {visibleItemsCount < items.length && (
+        <InlineStack align="center" gap="200">
+          {isLoadingMore ? (
+            <Spinner size="small" />
+          ) : (
+            <Button
+              size="slim"
+              onClick={() => setVisibleItemsCount((prev) => Math.min(prev + CHUNK_SIZE, items.length))}
+            >
+              Load Next 50 Products ({items.length - visibleItemsCount} Remaining)
+            </Button>
+          )}
+        </InlineStack>
+      )}
+    </BlockStack>
   );
 }
 
@@ -1128,6 +1177,10 @@ function FocPullListView({ focGroups }) {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/*  5. MAIN FULFILLMENT DASHBOARD CONTROLLER                          */
+/* ------------------------------------------------------------------ */
+
 export default function FulfillmentDashboard() {
   const { allOrdersGrouped, groups, counts, pullListItems, focPullList, totalOrdersCount } = useLoaderData();
 
@@ -1147,16 +1200,14 @@ export default function FulfillmentDashboard() {
   const [selectedTab, setSelectedTab] = useState(0);
   const [channelFilter, setChannelFilter] = useState([]);
   const [sortOrder, setSortOrder] = useState("default");
-  const [isFiltersFolded, setIsFiltersFolded] = useState(true); // Default folded/closed
+  const [isFiltersFolded, setIsFiltersFolded] = useState(true);
   const [queryValue, setQueryValue] = useState("");
   const [expandedGroups, setExpandedGroups] = useState(new Set());
 
-  const [currentPage, setCurrentPage] = useState(1);
-
-  // Jab bhi tab ya filters change hon, page 1 par reset karein
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [selectedTab, queryValue, channelFilter, sortOrder]);
+  // Infinite Scroll / Chunk limit for main customer list (50 per batch)
+  const [visibleGroupCount, setVisibleGroupCount] = useState(CHUNK_SIZE);
+  const [isGroupLoadingMore, setIsGroupLoadingMore] = useState(false);
+  const groupSentinelRef = useRef(null);
 
   const onToggleGroup = useCallback((key) => {
     setExpandedGroups((prev) => {
@@ -1172,7 +1223,7 @@ export default function FulfillmentDashboard() {
     { id: "ready-to-ship", content: "Ready to Ship", badgeCount: counts.readyToShip, bucketKey: "readyToShip" },
     { id: "on-hold", content: "On Hold Orders", badgeCount: counts.onHold, bucketKey: "onHold" },
     { id: "at-grading", content: "At Grading (CGC)", badgeCount: counts.atGrading, bucketKey: "atGrading" },
-    { id: "partially-ready", content: "Partially Ready", badgeCount: counts.partiallyReady, bucketKey: "partiallyReady" },
+    { id: "partiallyReady", content: "Partially Ready", badgeCount: counts.partiallyReady, bucketKey: "partiallyReady" },
     { id: "waiting-on-release", content: "Waiting on Release", badgeCount: counts.waitingOnRelease, bucketKey: "waitingOnRelease" },
     { id: "completed-shipped", content: "Completed / Shipped", badgeCount: counts.completed, bucketKey: "completed" },
     { id: "cancelled-orders", content: "Cancelled Orders", badgeCount: counts.cancelled, bucketKey: "cancelled" },
@@ -1180,14 +1231,13 @@ export default function FulfillmentDashboard() {
 
   const activeBucketKey = tabs[selectedTab].bucketKey;
 
-  // Sorting and Filtering Engine
+  // Filter and Sort Engine
   const filteredGroups = useMemo(() => {
     const isSearching = Boolean(queryValue.trim());
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
     const byChannel = filterGroupsByChannel(base, channelFilter);
     const result = filterGroupsByQuery(byChannel, queryValue);
 
-    // Apply Sorting (Oldest first solve karta hai Jim Adams ki concern ko)
     return [...result].sort((a, b) => {
       if (sortOrder === "date_asc") {
         return (a.oldestOrderDate || 0) - (b.oldestOrderDate || 0);
@@ -1195,7 +1245,6 @@ export default function FulfillmentDashboard() {
       if (sortOrder === "date_desc") {
         return (b.latestOrderDate || 0) - (a.latestOrderDate || 0);
       }
-      // Default: Safety flag first -> Hold -> Multi order -> Aging urgency
       if (a.hasSafetyFlag !== b.hasSafetyFlag) return a.hasSafetyFlag ? -1 : 1;
       if (a.isMultiOrder !== b.isMultiOrder) return a.isMultiOrder ? -1 : 1;
       const rank = { critical: 0, warning: 1, null: 2 };
@@ -1203,17 +1252,38 @@ export default function FulfillmentDashboard() {
     });
   }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue, sortOrder]);
 
+  // Tab ya filter change hone par chunk wapas 50 par reset hoga
+  useEffect(() => {
+    setVisibleGroupCount(CHUNK_SIZE);
+  }, [selectedTab, queryValue, channelFilter, sortOrder]);
+
+  // Global search trigger par auto-expand
   useEffect(() => {
     if (queryValue.trim()) {
       setExpandedGroups(new Set(filteredGroups.map((r) => r.key)));
     }
   }, [queryValue, filteredGroups]);
 
-  const totalPages = Math.ceil(filteredGroups.length / PAGE_SIZE) || 1;
-  const paginatedGroups = useMemo(() => {
-    const start = (currentPage - 1) * PAGE_SIZE;
-    return filteredGroups.slice(start, start + PAGE_SIZE);
-  }, [filteredGroups, currentPage]);
+  // Infinite Scroll Listener for Customer Orders (50-50 chunk load)
+  useEffect(() => {
+    if (!groupSentinelRef.current) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting && visibleGroupCount < filteredGroups.length && !isGroupLoadingMore) {
+        setIsGroupLoadingMore(true);
+        setTimeout(() => {
+          setVisibleGroupCount((prev) => Math.min(prev + CHUNK_SIZE, filteredGroups.length));
+          setIsGroupLoadingMore(false);
+        }, 150);
+      }
+    }, { rootMargin: "200px" });
+
+    observer.observe(groupSentinelRef.current);
+    return () => observer.disconnect();
+  }, [visibleGroupCount, filteredGroups.length, isGroupLoadingMore]);
+
+  const visibleGroups = useMemo(() => {
+    return filteredGroups.slice(0, visibleGroupCount);
+  }, [filteredGroups, visibleGroupCount]);
 
   const filteredPullListItems = useMemo(() => {
     if (channelFilter.length === 0) return pullListItems;
@@ -1226,7 +1296,7 @@ export default function FulfillmentDashboard() {
     <AppProvider i18n={enTranslations}>
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Metafield Synchronization Queue Engine • Total Orders Ingested: ${totalOrdersCount}`}
+        subtitle={`Live Metafield Synchronization Engine • Total Orders Ingested: ${totalOrdersCount}`}
         primaryAction={{
           content: "Sync Orders Now",
           icon: RefreshIcon,
@@ -1242,7 +1312,6 @@ export default function FulfillmentDashboard() {
                 selected={selectedTab}
                 onSelect={(idx) => {
                   setSelectedTab(idx);
-                  // CGC tab pe switch hone par automatically Oldest First set kar dega taake koi order miss na ho
                   if (tabs[idx].bucketKey === "atGrading") {
                     setSortOrder("date_asc");
                   }
@@ -1250,13 +1319,13 @@ export default function FulfillmentDashboard() {
               />
               <Box padding="400">
                 <BlockStack gap="400">
-                  {/* Search and Folded Filter Bar */}
+                  {/* ISOLATED FILTER ROW - FORAN LOAD HOGI */}
                   <BlockStack gap="200">
                     <InlineStack gap="300" align="space-between" blockAlign="center">
                       <div style={{ flex: 1 }}>
                         <Filters
                           queryValue={queryValue}
-                          queryPlaceholder="Global Search: Type Order # (#5078) or Customer Name..."
+                          queryPlaceholder="Search Order # (#5078) or Customer Name..."
                           onQueryChange={setQueryValue}
                           onQueryClear={() => setQueryValue("")}
                           onClearAll={() => {
@@ -1276,7 +1345,7 @@ export default function FulfillmentDashboard() {
                       </Button>
                     </InlineStack>
 
-                    {/* FOLDABLE FILTER SECTION */}
+                    {/* COLLAPSIBLE FILTER CONTROLS */}
                     <Collapsible
                       open={!isFiltersFolded}
                       id="order-manager-filters-collapsible"
@@ -1284,13 +1353,13 @@ export default function FulfillmentDashboard() {
                     >
                       <Box padding="300" background="bg-surface-secondary" borderRadius="200">
                         <InlineStack gap="600" blockAlign="start" wrap>
-                          <div style={{ minWidth: "200px" }}>
+                          <div style={{ minWidth: "220px" }}>
                             <Select
                               label="Sort Orders By"
                               options={SORT_OPTIONS}
                               value={sortOrder}
                               onChange={setSortOrder}
-                              helpText={activeBucketKey === "atGrading" ? "Client recommends Oldest First for CGC." : undefined}
+                              helpText={activeBucketKey === "atGrading" ? "Oldest first ensures no returning CGC orders get missed." : undefined}
                             />
                           </div>
                           <div style={{ minWidth: "220px" }}>
@@ -1324,7 +1393,7 @@ export default function FulfillmentDashboard() {
                   {queryValue.trim() && (
                     <Banner tone="info" icon={SearchIcon}>
                       <Text as="p" fontWeight="bold">
-                        Global Search Active: Showing results matching "{queryValue}" across all store records.
+                        Search Results: Showing matches for "{queryValue}"
                       </Text>
                     </Banner>
                   )}
@@ -1333,7 +1402,7 @@ export default function FulfillmentDashboard() {
                     <Banner tone="warning" icon={LockIcon}>
                       <Text as="p" fontWeight="semibold">Fulfillment Hold Queue</Text>
                       <Text as="p">
-                        All orders tagged with <code>ship-hold</code> or under active native fulfillment holds. Batch printing locked.
+                        All orders tagged with <code>ship-hold</code> or placed on fulfillment hold. Batch pick slips locked.
                       </Text>
                     </Banner>
                   )}
@@ -1350,7 +1419,7 @@ export default function FulfillmentDashboard() {
                   {activeBucketKey === "partiallyReady" && !queryValue.trim() && (
                     <Banner tone="warning" icon={PackageIcon}>
                       <Text as="p" fontWeight="semibold">Warehouse Extract / Harvest Pull List</Text>
-                      <Text as="p">Extract these line items from storage racks immediately. They are physically released but bound inside composite pre-order allocations.</Text>
+                      <Text as="p">Extract these line items from storage racks immediately. Products load 50 at a time on scroll.</Text>
                       <Box paddingBlockStart="300">
                         <PullListTable items={filteredPullListItems} />
                       </Box>
@@ -1361,55 +1430,53 @@ export default function FulfillmentDashboard() {
                     <BlockStack gap="300">
                       <Banner tone="info" icon={CalendarIcon}>
                         <Text as="p" fontWeight="semibold">FOC Weekly Ordering Pull List</Text>
-                        <Text as="p">All unreleased items grouped by their FOC (Final Order Cutoff) deadline for vendor order placement.</Text>
+                        <Text as="p">All unreleased items grouped by their FOC (Final Order Cutoff) deadline.</Text>
                       </Banner>
                       <FocPullListView focGroups={focPullList} />
                     </BlockStack>
                   )}
 
-                  <Box paddingBlockStart="200">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <Text as="h3" variant="headingSm" tone="subdued">
-                        Orders in Queue ({filteredGroups.length} Customers) — Showing Page {currentPage} of {totalPages}
-                      </Text>
-                      {filteredGroups.length > PAGE_SIZE && (
-                        <Pagination
-                          hasPrevious={currentPage > 1}
-                          onPrevious={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                          hasNext={currentPage < totalPages}
-                          onNext={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                  {/* MAIN ORDERS SECTION (CHUNK LOADED) */}
+                  {activeBucketKey !== "partiallyReady" && (
+                    <Box paddingBlockStart="200">
+                      <InlineStack align="space-between" blockAlign="center">
+                        <Text as="h3" variant="headingSm" tone="subdued">
+                          Orders in Queue: Showing {visibleGroups.length} of {filteredGroups.length} Customers
+                        </Text>
+                        {visibleGroups.length < filteredGroups.length && (
+                          <Badge tone="info">Scroll down to auto-load 50 more</Badge>
+                        )}
+                      </InlineStack>
+
+                      <Box paddingBlockStart="300">
+                        <BucketIndexTable
+                          groups={visibleGroups}
+                          bucketKey={activeBucketKey}
+                          expandedGroups={expandedGroups}
+                          onToggleGroup={onToggleGroup}
                         />
-                      )}
-                    </InlineStack>
-
-                    <Box paddingBlockStart="300">
-                      <BucketIndexTable
-                        groups={paginatedGroups}
-                        bucketKey={activeBucketKey}
-                        expandedGroups={expandedGroups}
-                        onToggleGroup={onToggleGroup}
-                      />
-                    </Box>
-
-                    {filteredGroups.length > PAGE_SIZE && (
-                      <Box paddingBlockStart="400">
-                        <InlineStack align="center">
-                          <Pagination
-                            hasPrevious={currentPage > 1}
-                            onPrevious={() => {
-                              setCurrentPage((p) => Math.max(1, p - 1));
-                              window.scrollTo({ top: 0, behavior: "smooth" });
-                            }}
-                            hasNext={currentPage < totalPages}
-                            onNext={() => {
-                              setCurrentPage((p) => Math.min(totalPages, p + 1));
-                              window.scrollTo({ top: 0, behavior: "smooth" });
-                            }}
-                          />
-                        </InlineStack>
                       </Box>
-                    )}
-                  </Box>
+
+                      {/* SCROLL SENTINEL FOR INFINITE SCROLL */}
+                      <div ref={groupSentinelRef} style={{ height: "30px", marginTop: "10px" }} />
+
+                      {visibleGroups.length < filteredGroups.length && (
+                        <Box paddingBlock="400">
+                          <InlineStack align="center" gap="200">
+                            {isGroupLoadingMore ? (
+                              <Spinner size="small" />
+                            ) : (
+                              <Button
+                                onClick={() => setVisibleGroupCount((p) => Math.min(p + CHUNK_SIZE, filteredGroups.length))}
+                              >
+                                Load Next 50 Orders ({filteredGroups.length - visibleGroups.length} Remaining)
+                              </Button>
+                            )}
+                          </InlineStack>
+                        </Box>
+                      )}
+                    </Box>
+                  )}
                 </BlockStack>
               </Box>
             </Card>
