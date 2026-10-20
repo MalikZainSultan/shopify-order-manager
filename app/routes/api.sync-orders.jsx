@@ -1,5 +1,5 @@
+import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import shopify, { authenticate } from "../shopify.server";
 
 const jsonResponse = (data, status = 200) => {
   return new Response(JSON.stringify(data), {
@@ -78,39 +78,31 @@ export const loader = async ({ request }) => {
   try {
     let admin = null;
 
-    // 1. Session Auth (Same as before)
+    // 1. Shopify Authenticated Admin Session Check
     try {
       const auth = await authenticate.admin(request);
       admin = auth.admin;
     } catch {
-      const url = new URL(request.url);
-      const shopParam = url.searchParams.get("shop") || "yppy8z-d9.myshopify.com";
-
-      const session =
-        (await prisma.session.findFirst({
-          where: {
-            shop: { contains: shopParam.replace(".myshopify.com", "") },
-          },
-          orderBy: { id: "desc" },
-        })) ||
-        (await prisma.session.findFirst({
-          orderBy: { id: "desc" },
-        }));
+      const session = await prisma.session.findFirst({
+        orderBy: { id: "desc" },
+      });
 
       if (!session) {
-        return jsonResponse(
-          { success: false, message: "No active session in database." },
-          200
-        );
+        return jsonResponse({ success: false, message: "Session expired in database." }, 401);
       }
 
-      const client = new shopify.api.clients.Graphql({ session });
+      // Fallback direct Graphql Client
       admin = {
         graphql: async (query, options) => {
-          const res = await client.query({
-            data: { query, variables: options?.variables },
+          const endpoint = `https://${session.shop}/admin/api/2024-04/graphql.json`;
+          return fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Shopify-Access-Token": session.accessToken,
+            },
+            body: JSON.stringify({ query, variables: options?.variables }),
           });
-          return { json: async () => res.body };
         },
       };
     }
@@ -118,7 +110,6 @@ export const loader = async ({ request }) => {
     const url = new URL(request.url);
     const cursor = url.searchParams.get("cursor") || null;
 
-    // 2. Fetch full 250 orders batch with cursor pagination
     const response = await admin.graphql(DETAILED_ORDERS_CHUNK_QUERY, {
       variables: { cursor },
     });
@@ -126,16 +117,13 @@ export const loader = async ({ request }) => {
     const payload = await response.json();
 
     if (payload.errors) {
-      console.error("Shopify GraphQL Sync Error:", payload.errors);
-      return jsonResponse(
-        {
-          success: false,
-          error: payload.errors[0]?.message || "GraphQL query error",
-          orders: [],
-          hasNextPage: false,
-        },
-        200
-      );
+      console.error("Shopify GraphQL Error:", payload.errors);
+      return jsonResponse({
+        success: false,
+        error: payload.errors[0]?.message || "GraphQL error",
+        orders: [],
+        hasNextPage: false,
+      });
     }
 
     const ordersData = payload.data?.orders;
@@ -143,19 +131,16 @@ export const loader = async ({ request }) => {
     const hasNextPage = Boolean(ordersData?.pageInfo?.hasNextPage);
     const endCursor = ordersData?.pageInfo?.endCursor || null;
 
-    // 3. Return both original heartbeat properties + new Ajax sync data
     return jsonResponse({
       success: true,
-      message: "Order sync heartbeat active",
       orders,
       syncedCount: orders.length,
-      latestOrder: orders[0]?.name || null,
       hasNextPage,
       endCursor,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Order Sync Error:", error);
-    return jsonResponse({ success: false, error: error.message }, 200);
+    console.error("API Order Sync Error:", error);
+    return jsonResponse({ success: false, error: error.message }, 500);
   }
 };

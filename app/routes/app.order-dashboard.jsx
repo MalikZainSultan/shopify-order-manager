@@ -134,7 +134,7 @@ export const loader = async ({ request }) => {
       initialCursor,
     });
   } catch (err) {
-    console.error("Initial Load Error:", err);
+    console.error("Initial Orders Loader Error:", err);
     return jsonResponse({
       initialOrders: [],
       initialHasNext: false,
@@ -1125,7 +1125,7 @@ function FocPullListView({ focGroups }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  4. MAIN FULFILLMENT DASHBOARD CONTROLLER (AJAX SYNCED)            */
+/*  4. MAIN FULFILLMENT DASHBOARD CONTROLLER                          */
 /* ------------------------------------------------------------------ */
 
 export default function FulfillmentDashboard() {
@@ -1133,7 +1133,6 @@ export default function FulfillmentDashboard() {
 
   // Full Accumulator State for all store orders
   const [storeOrders, setStoreOrders] = useState(initialOrders || []);
-  const [isSyncingStore, setIsSyncingStore] = useState(false);
   const [syncCursor, setSyncCursor] = useState(initialCursor);
   const [syncHasNext, setSyncHasNext] = useState(initialHasNext);
 
@@ -1144,6 +1143,10 @@ export default function FulfillmentDashboard() {
   const handleSyncB2G1 = () => {
     b2g1Fetcher.load("/api/sync-b2g1");
   };
+
+  // Orders Sync Fetcher (Authenticated React Router Fetcher)
+  const syncFetcher = useFetcher();
+  const isSyncingStore = syncFetcher.state === "submitting" || syncFetcher.state === "loading";
 
   // Tab & Filters
   const [selectedTab, setSelectedTab] = useState(0);
@@ -1157,44 +1160,37 @@ export default function FulfillmentDashboard() {
   const [visibleGroupCount, setVisibleGroupCount] = useState(CHUNK_SIZE);
   const groupSentinelRef = useRef(null);
 
-  // AUTOMATIC BACKGROUND AJAX SYNC WORKER
-  // Ingests 250 orders per call in background until all orders are fetched
+  // AUTOMATIC BACKGROUND ORDERS FETCHER (SAFE AJAX LOOP)
   useEffect(() => {
-    if (!syncHasNext || isSyncingStore) return;
+    if (syncHasNext && !isSyncingStore && syncFetcher.state === "idle") {
+      const cursorParam = syncCursor ? `&cursor=${encodeURIComponent(syncCursor)}` : "";
+      syncFetcher.load(`/api/sync-orders?t=${Date.now()}${cursorParam}`);
+    }
+  }, [syncHasNext, syncCursor, isSyncingStore, syncFetcher.state]);
 
-    let isMounted = true;
-    const fetchNextBatch = async () => {
-      setIsSyncingStore(true);
-      try {
-        const url = `/api/sync-orders?cursor=${encodeURIComponent(syncCursor || "")}`;
-        const res = await fetch(url);
-        const data = await res.json();
-
-        if (isMounted && data.orders && data.orders.length > 0) {
-          setStoreOrders((prev) => {
-            const seen = new Set(prev.map((o) => o.id));
-            const fresh = data.orders.filter((o) => !seen.has(o.id));
-            return [...prev, ...fresh];
-          });
-          setSyncHasNext(Boolean(data.hasNextPage));
-          setSyncCursor(data.endCursor || null);
-        } else {
-          setSyncHasNext(false);
-        }
-      } catch (err) {
-        console.error("Background sync error:", err);
+  // Handle Response from Sync Fetcher
+  useEffect(() => {
+    if (syncFetcher.data) {
+      const data = syncFetcher.data;
+      if (data.success && data.orders && data.orders.length > 0) {
+        setStoreOrders((prev) => {
+          const seen = new Set(prev.map((o) => o.id));
+          const fresh = data.orders.filter((o) => !seen.has(o.id));
+          return [...prev, ...fresh];
+        });
+        setSyncHasNext(Boolean(data.hasNextPage));
+        setSyncCursor(data.endCursor || null);
+      } else {
         setSyncHasNext(false);
-      } finally {
-        if (isMounted) setIsSyncingStore(false);
       }
-    };
+    }
+  }, [syncFetcher.data]);
 
-    const timer = setTimeout(fetchNextBatch, 500);
-    return () => {
-      isMounted = false;
-      clearTimeout(timer);
-    };
-  }, [syncHasNext, syncCursor, isSyncingStore]);
+  const handleForceSync = () => {
+    setSyncHasNext(true);
+    setSyncCursor(null);
+    syncFetcher.load(`/api/sync-orders?t=${Date.now()}`);
+  };
 
   // Process Accumulated Live Orders
   const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = useMemo(() => {
@@ -1283,13 +1279,10 @@ export default function FulfillmentDashboard() {
         title="Release Date Automated Dispatch Board"
         subtitle={`Live Store Ingestion: ${storeOrders.length} Orders Synchronized`}
         primaryAction={{
-          content: isSyncingStore ? "Syncing Store in Background..." : "Force Sync",
+          content: isSyncingStore ? "Syncing Batch..." : "Sync All Orders",
           icon: RefreshIcon,
           loading: isSyncingStore,
-          onAction: () => {
-            setSyncHasNext(true);
-            setSyncCursor(null);
-          },
+          onAction: handleForceSync,
         }}
       >
         <Layout>
