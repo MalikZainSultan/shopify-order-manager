@@ -23,6 +23,7 @@ import {
   Select,
   Collapsible,
   Spinner,
+  ProgressBar,
 } from "@shopify/polaris";
 import enTranslations from "@shopify/polaris/locales/en.json";
 import {
@@ -48,16 +49,16 @@ const jsonResponse = (data) => {
 };
 
 /* ------------------------------------------------------------------ */
-/*  1. UNLIMITED RECURSIVE STORE FETCHING                             */
+/*  1. INITIAL FAST STORE LOADER (FIRST 250 BATCH)                    */
 /* ------------------------------------------------------------------ */
 
-const ALL_STORE_ORDERS_QUERY = `#graphql
-  query FetchAllStoreOrders($cursor: String) {
+const INITIAL_STORE_ORDERS_QUERY = `#graphql
+  query FetchInitialStoreOrders {
     orders(
       first: 250
-      after: $cursor
       sortKey: CREATED_AT
       reverse: true
+      query: "status:any"
     ) {
       pageInfo {
         hasNextPage
@@ -116,65 +117,31 @@ const ALL_STORE_ORDERS_QUERY = `#graphql
   }
 `;
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const loader = async ({ request }) => {
+  const { admin } = await authenticate.admin(request);
+  try {
+    const response = await admin.graphql(INITIAL_STORE_ORDERS_QUERY);
+    const payload = await response.json();
 
-async function fetchAllStoreOrdersUnlimited(admin) {
-  const allOrders = [];
-  const seenIds = new Set();
-  let cursor = null;
-  let hasNextPage = true;
-  let retryCount = 0;
+    const ordersData = payload.data?.orders;
+    const initialOrders = ordersData?.edges ? ordersData.edges.map((e) => e.node) : [];
+    const initialHasNext = Boolean(ordersData?.pageInfo?.hasNextPage);
+    const initialCursor = ordersData?.pageInfo?.endCursor || null;
 
-  while (hasNextPage && retryCount < 5) {
-    try {
-      const response = await admin.graphql(ALL_STORE_ORDERS_QUERY, {
-        variables: { cursor },
-      });
-
-      if (response.status === 429) {
-        await delay(2000);
-        retryCount++;
-        continue;
-      }
-
-      const payload = await response.json();
-
-      if (payload.errors) {
-        console.error("Shopify GraphQL Error:", JSON.stringify(payload.errors));
-        const isThrottled = payload.errors.some(
-          (e) => e.extensions?.code === "THROTTLED" || e.message?.toLowerCase().includes("throttled")
-        );
-        if (isThrottled) {
-          await delay(2000);
-          retryCount++;
-          continue;
-        }
-        break;
-      }
-
-      const ordersData = payload.data?.orders;
-      if (!ordersData?.edges || ordersData.edges.length === 0) break;
-
-      for (const edge of ordersData.edges) {
-        if (!seenIds.has(edge.node.id)) {
-          seenIds.add(edge.node.id);
-          allOrders.push(edge.node);
-        }
-      }
-
-      hasNextPage = Boolean(ordersData.pageInfo?.hasNextPage);
-      cursor = ordersData.pageInfo?.endCursor || null;
-      retryCount = 0;
-      await delay(40);
-    } catch (err) {
-      console.error("Fetch Loop Error:", err);
-      retryCount++;
-      await delay(1000);
-    }
+    return jsonResponse({
+      initialOrders,
+      initialHasNext,
+      initialCursor,
+    });
+  } catch (err) {
+    console.error("Initial Load Error:", err);
+    return jsonResponse({
+      initialOrders: [],
+      initialHasNext: false,
+      initialCursor: null,
+    });
   }
-
-  return allOrders;
-}
+};
 
 /* ------------------------------------------------------------------ */
 /*  2. US TIMEZONE & DATA PROCESSING ENGINE                           */
@@ -546,7 +513,7 @@ function buildFocPullList(waitingOrders) {
     });
 }
 
-function processOrders(rawOrders) {
+function processOrdersList(rawOrders) {
   const today = startOfTodayInUS();
   const buckets = {
     allUnfulfilled: [],
@@ -636,21 +603,6 @@ function processOrders(rawOrders) {
   };
 }
 
-export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
-  const rawOrders = await fetchAllStoreOrdersUnlimited(admin);
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = processOrders(rawOrders);
-
-  return jsonResponse({
-    allOrdersGrouped,
-    groups,
-    counts,
-    pullListItems,
-    focPullList,
-    totalOrdersCount: rawOrders.length,
-  });
-};
-
 /* ------------------------------------------------------------------ */
 /*  3. USER INTERFACE COMPONENTS & CHUNK RENDERERS                   */
 /* ------------------------------------------------------------------ */
@@ -667,7 +619,7 @@ const SORT_OPTIONS = [
   { label: "Default / Urgency Priority", value: "default" },
 ];
 
-const CHUNK_SIZE = 50; // Scroll par 50 50 items load honge
+const CHUNK_SIZE = 50;
 
 function formatDate(dateString) {
   if (!dateString) return "—";
@@ -1017,10 +969,6 @@ function BucketIndexTable({ groups, bucketKey, expandedGroups, onToggleGroup }) 
   );
 }
 
-/* ------------------------------------------------------------------ */
-/*  4. PRODUCT HARVEST PULL LIST WITH SCROLL CHUNKING (50 PER LOAD)   */
-/* ------------------------------------------------------------------ */
-
 function PullListTable({ items }) {
   const [visibleItemsCount, setVisibleItemsCount] = useState(CHUNK_SIZE);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -1030,7 +978,6 @@ function PullListTable({ items }) {
     setVisibleItemsCount(CHUNK_SIZE);
   }, [items]);
 
-  // Infinite Scroll Trigger via IntersectionObserver
   useEffect(() => {
     if (!sentinelRef.current) return;
     const observer = new IntersectionObserver((entries) => {
@@ -1178,18 +1125,19 @@ function FocPullListView({ focGroups }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  5. MAIN FULFILLMENT DASHBOARD CONTROLLER                          */
+/*  4. MAIN FULFILLMENT DASHBOARD CONTROLLER (AJAX SYNCED)            */
 /* ------------------------------------------------------------------ */
 
 export default function FulfillmentDashboard() {
-  const { allOrdersGrouped, groups, counts, pullListItems, focPullList, totalOrdersCount } = useLoaderData();
+  const { initialOrders, initialHasNext, initialCursor } = useLoaderData();
 
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const handleManualSync = () => {
-    setIsRefreshing(true);
-    window.location.reload();
-  };
+  // Full Accumulator State for all store orders
+  const [storeOrders, setStoreOrders] = useState(initialOrders || []);
+  const [isSyncingStore, setIsSyncingStore] = useState(false);
+  const [syncCursor, setSyncCursor] = useState(initialCursor);
+  const [syncHasNext, setSyncHasNext] = useState(initialHasNext);
 
+  // Promotion Fetcher
   const b2g1Fetcher = useFetcher();
   const isSyncingB2G1 = b2g1Fetcher.state === "submitting" || b2g1Fetcher.state === "loading";
 
@@ -1197,6 +1145,7 @@ export default function FulfillmentDashboard() {
     b2g1Fetcher.load("/api/sync-b2g1");
   };
 
+  // Tab & Filters
   const [selectedTab, setSelectedTab] = useState(0);
   const [channelFilter, setChannelFilter] = useState([]);
   const [sortOrder, setSortOrder] = useState("default");
@@ -1204,10 +1153,53 @@ export default function FulfillmentDashboard() {
   const [queryValue, setQueryValue] = useState("");
   const [expandedGroups, setExpandedGroups] = useState(new Set());
 
-  // Infinite Scroll / Chunk limit for main customer list (50 per batch)
+  // Infinite Scroll chunk limit
   const [visibleGroupCount, setVisibleGroupCount] = useState(CHUNK_SIZE);
-  const [isGroupLoadingMore, setIsGroupLoadingMore] = useState(false);
   const groupSentinelRef = useRef(null);
+
+  // AUTOMATIC BACKGROUND AJAX SYNC WORKER
+  // Ingests 250 orders per call in background until all orders are fetched
+  useEffect(() => {
+    if (!syncHasNext || isSyncingStore) return;
+
+    let isMounted = true;
+    const fetchNextBatch = async () => {
+      setIsSyncingStore(true);
+      try {
+        const url = `/api/sync-orders?cursor=${encodeURIComponent(syncCursor || "")}`;
+        const res = await fetch(url);
+        const data = await res.json();
+
+        if (isMounted && data.orders && data.orders.length > 0) {
+          setStoreOrders((prev) => {
+            const seen = new Set(prev.map((o) => o.id));
+            const fresh = data.orders.filter((o) => !seen.has(o.id));
+            return [...prev, ...fresh];
+          });
+          setSyncHasNext(Boolean(data.hasNextPage));
+          setSyncCursor(data.endCursor || null);
+        } else {
+          setSyncHasNext(false);
+        }
+      } catch (err) {
+        console.error("Background sync error:", err);
+        setSyncHasNext(false);
+      } finally {
+        if (isMounted) setIsSyncingStore(false);
+      }
+    };
+
+    const timer = setTimeout(fetchNextBatch, 500);
+    return () => {
+      isMounted = false;
+      clearTimeout(timer);
+    };
+  }, [syncHasNext, syncCursor, isSyncingStore]);
+
+  // Process Accumulated Live Orders
+  const { allOrdersGrouped, groups, counts, pullListItems, focPullList } = useMemo(() => {
+    return processOrdersList(storeOrders);
+  }, [storeOrders]);
 
   const onToggleGroup = useCallback((key) => {
     setExpandedGroups((prev) => {
@@ -1231,7 +1223,6 @@ export default function FulfillmentDashboard() {
 
   const activeBucketKey = tabs[selectedTab].bucketKey;
 
-  // Filter and Sort Engine
   const filteredGroups = useMemo(() => {
     const isSearching = Boolean(queryValue.trim());
     const base = isSearching ? allOrdersGrouped : (groups[activeBucketKey] || []);
@@ -1252,34 +1243,28 @@ export default function FulfillmentDashboard() {
     });
   }, [groups, allOrdersGrouped, activeBucketKey, channelFilter, queryValue, sortOrder]);
 
-  // Tab ya filter change hone par chunk wapas 50 par reset hoga
   useEffect(() => {
     setVisibleGroupCount(CHUNK_SIZE);
   }, [selectedTab, queryValue, channelFilter, sortOrder]);
 
-  // Global search trigger par auto-expand
   useEffect(() => {
     if (queryValue.trim()) {
       setExpandedGroups(new Set(filteredGroups.map((r) => r.key)));
     }
   }, [queryValue, filteredGroups]);
 
-  // Infinite Scroll Listener for Customer Orders (50-50 chunk load)
+  // Infinite Scroll Trigger for Groups
   useEffect(() => {
     if (!groupSentinelRef.current) return;
     const observer = new IntersectionObserver((entries) => {
-      if (entries[0].isIntersecting && visibleGroupCount < filteredGroups.length && !isGroupLoadingMore) {
-        setIsGroupLoadingMore(true);
-        setTimeout(() => {
-          setVisibleGroupCount((prev) => Math.min(prev + CHUNK_SIZE, filteredGroups.length));
-          setIsGroupLoadingMore(false);
-        }, 150);
+      if (entries[0].isIntersecting && visibleGroupCount < filteredGroups.length) {
+        setVisibleGroupCount((prev) => Math.min(prev + CHUNK_SIZE, filteredGroups.length));
       }
-    }, { rootMargin: "200px" });
+    }, { rootMargin: "250px" });
 
     observer.observe(groupSentinelRef.current);
     return () => observer.disconnect();
-  }, [visibleGroupCount, filteredGroups.length, isGroupLoadingMore]);
+  }, [visibleGroupCount, filteredGroups.length]);
 
   const visibleGroups = useMemo(() => {
     return filteredGroups.slice(0, visibleGroupCount);
@@ -1296,16 +1281,39 @@ export default function FulfillmentDashboard() {
     <AppProvider i18n={enTranslations}>
       <Page
         title="Release Date Automated Dispatch Board"
-        subtitle={`Live Metafield Synchronization Engine • Total Orders Ingested: ${totalOrdersCount}`}
+        subtitle={`Live Store Ingestion: ${storeOrders.length} Orders Synchronized`}
         primaryAction={{
-          content: "Sync Orders Now",
+          content: isSyncingStore ? "Syncing Store in Background..." : "Force Sync",
           icon: RefreshIcon,
-          loading: isRefreshing,
-          onAction: handleManualSync,
+          loading: isSyncingStore,
+          onAction: () => {
+            setSyncHasNext(true);
+            setSyncCursor(null);
+          },
         }}
       >
         <Layout>
           <Layout.Section>
+            {/* BACKGROUND SYNC STATUS BANNER */}
+            {syncHasNext && (
+              <Box paddingBlockEnd="300">
+                <Banner tone="info">
+                  <BlockStack gap="200">
+                    <InlineStack align="space-between">
+                      <Text as="p" fontWeight="bold">
+                        Background Ajax Syncing Active: Ingested {storeOrders.length} orders so far...
+                      </Text>
+                      <Spinner size="small" />
+                    </InlineStack>
+                    <ProgressBar
+                      progress={Math.min(95, Math.floor((storeOrders.length / (storeOrders.length + 250)) * 100))}
+                      size="small"
+                    />
+                  </BlockStack>
+                </Banner>
+              </Box>
+            )}
+
             <Card padding="0">
               <Tabs
                 tabs={tabs.map((tab) => ({ id: tab.id, content: `${tab.content} (${tab.badgeCount})` }))}
@@ -1319,13 +1327,13 @@ export default function FulfillmentDashboard() {
               />
               <Box padding="400">
                 <BlockStack gap="400">
-                  {/* ISOLATED FILTER ROW - FORAN LOAD HOGI */}
+                  {/* ISOLATED FILTER ROW */}
                   <BlockStack gap="200">
                     <InlineStack gap="300" align="space-between" blockAlign="center">
                       <div style={{ flex: 1 }}>
                         <Filters
                           queryValue={queryValue}
-                          queryPlaceholder="Search Order # (#5078) or Customer Name..."
+                          queryPlaceholder="Search Order # or Buyer Name..."
                           onQueryChange={setQueryValue}
                           onQueryClear={() => setQueryValue("")}
                           onClearAll={() => {
@@ -1345,7 +1353,6 @@ export default function FulfillmentDashboard() {
                       </Button>
                     </InlineStack>
 
-                    {/* COLLAPSIBLE FILTER CONTROLS */}
                     <Collapsible
                       open={!isFiltersFolded}
                       id="order-manager-filters-collapsible"
@@ -1436,7 +1443,7 @@ export default function FulfillmentDashboard() {
                     </BlockStack>
                   )}
 
-                  {/* MAIN ORDERS SECTION (CHUNK LOADED) */}
+                  {/* ORDERS QUEUE */}
                   {activeBucketKey !== "partiallyReady" && (
                     <Box paddingBlockStart="200">
                       <InlineStack align="space-between" blockAlign="center">
@@ -1457,21 +1464,15 @@ export default function FulfillmentDashboard() {
                         />
                       </Box>
 
-                      {/* SCROLL SENTINEL FOR INFINITE SCROLL */}
-                      <div ref={groupSentinelRef} style={{ height: "30px", marginTop: "10px" }} />
+                      {/* SCROLL TRIGGER */}
+                      <div ref={groupSentinelRef} style={{ height: "40px" }} />
 
                       {visibleGroups.length < filteredGroups.length && (
-                        <Box paddingBlock="400">
-                          <InlineStack align="center" gap="200">
-                            {isGroupLoadingMore ? (
-                              <Spinner size="small" />
-                            ) : (
-                              <Button
-                                onClick={() => setVisibleGroupCount((p) => Math.min(p + CHUNK_SIZE, filteredGroups.length))}
-                              >
-                                Load Next 50 Orders ({filteredGroups.length - visibleGroups.length} Remaining)
-                              </Button>
-                            )}
+                        <Box paddingBlock="300">
+                          <InlineStack align="center">
+                            <Button onClick={() => setVisibleGroupCount((p) => p + CHUNK_SIZE)}>
+                              Load More Orders ({filteredGroups.length - visibleGroups.length} Remaining)
+                            </Button>
                           </InlineStack>
                         </Box>
                       )}
@@ -1482,6 +1483,7 @@ export default function FulfillmentDashboard() {
             </Card>
           </Layout.Section>
 
+          {/* SIDE METRICS & B2G1 AUTOMATION */}
           <Layout.Section variant="oneThird">
             <Card>
               <BlockStack gap="300">

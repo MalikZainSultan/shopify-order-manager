@@ -8,10 +8,77 @@ const jsonResponse = (data, status = 200) => {
   });
 };
 
+const DETAILED_ORDERS_CHUNK_QUERY = `#graphql
+  query FetchOrdersChunk($cursor: String) {
+    orders(
+      first: 250
+      after: $cursor
+      sortKey: CREATED_AT
+      reverse: true
+      query: "status:any"
+    ) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      edges {
+        node {
+          id
+          name
+          createdAt
+          cancelledAt
+          cancelReason
+          displayFulfillmentStatus
+          displayFinancialStatus
+          tags
+          customer {
+            id
+            firstName
+            lastName
+            tags
+          }
+          email
+          shippingAddress {
+            name
+            address1
+            address2
+            city
+            zip
+            country
+          }
+          lineItems(first: 50) {
+            edges {
+              node {
+                id
+                title
+                variantTitle
+                sku
+                quantity
+                unfulfilledQuantity
+                product {
+                  id
+                  tags
+                  metafield(namespace: "custom", key: "release_date") {
+                    value
+                  }
+                  focMetafield: metafield(namespace: "custom", key: "foc_date") {
+                    value
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
 export const loader = async ({ request }) => {
   try {
     let admin = null;
 
+    // 1. Session Auth (Same as before)
     try {
       const auth = await authenticate.admin(request);
       admin = auth.admin;
@@ -19,17 +86,22 @@ export const loader = async ({ request }) => {
       const url = new URL(request.url);
       const shopParam = url.searchParams.get("shop") || "yppy8z-d9.myshopify.com";
 
-      const session = await prisma.session.findFirst({
-        where: {
-          shop: { contains: shopParam.replace(".myshopify.com", "") },
-        },
-        orderBy: { id: "desc" },
-      }) || await prisma.session.findFirst({
-        orderBy: { id: "desc" },
-      });
+      const session =
+        (await prisma.session.findFirst({
+          where: {
+            shop: { contains: shopParam.replace(".myshopify.com", "") },
+          },
+          orderBy: { id: "desc" },
+        })) ||
+        (await prisma.session.findFirst({
+          orderBy: { id: "desc" },
+        }));
 
       if (!session) {
-        return jsonResponse({ success: false, message: "No active session in database." }, 200);
+        return jsonResponse(
+          { success: false, message: "No active session in database." },
+          200
+        );
       }
 
       const client = new shopify.api.clients.Graphql({ session });
@@ -43,32 +115,43 @@ export const loader = async ({ request }) => {
       };
     }
 
-    // Shopify se recent unfulfilled aur active orders fetch karein
-    const response = await admin.graphql(
-      `#graphql
-      query CheckRecentOrders {
-        orders(first: 20, sortKey: CREATED_AT, reverse: true, query: "status:any") {
-          edges {
-            node {
-              id
-              name
-              createdAt
-              displayFulfillmentStatus
-              tags
-            }
-          }
-        }
-      }`
-    );
+    const url = new URL(request.url);
+    const cursor = url.searchParams.get("cursor") || null;
+
+    // 2. Fetch full 250 orders batch with cursor pagination
+    const response = await admin.graphql(DETAILED_ORDERS_CHUNK_QUERY, {
+      variables: { cursor },
+    });
 
     const payload = await response.json();
-    const recentOrders = payload.data?.orders?.edges?.map((e) => e.node) || [];
 
+    if (payload.errors) {
+      console.error("Shopify GraphQL Sync Error:", payload.errors);
+      return jsonResponse(
+        {
+          success: false,
+          error: payload.errors[0]?.message || "GraphQL query error",
+          orders: [],
+          hasNextPage: false,
+        },
+        200
+      );
+    }
+
+    const ordersData = payload.data?.orders;
+    const orders = ordersData?.edges ? ordersData.edges.map((e) => e.node) : [];
+    const hasNextPage = Boolean(ordersData?.pageInfo?.hasNextPage);
+    const endCursor = ordersData?.pageInfo?.endCursor || null;
+
+    // 3. Return both original heartbeat properties + new Ajax sync data
     return jsonResponse({
       success: true,
       message: "Order sync heartbeat active",
-      syncedCount: recentOrders.length,
-      latestOrder: recentOrders[0]?.name || null,
+      orders,
+      syncedCount: orders.length,
+      latestOrder: orders[0]?.name || null,
+      hasNextPage,
+      endCursor,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
