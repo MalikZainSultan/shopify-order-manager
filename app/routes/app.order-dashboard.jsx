@@ -376,6 +376,19 @@ function processOrder(rawOrder, today) {
   };
 }
 
+// Order number nikalta hai ("#1234" -> 1234). eBay jaise numbers ke liye bhi digits use hote hain.
+function orderNumberOf(order) {
+  const digits = ((order && order.name) || "").replace(/\D/g, "");
+  return digits ? Number(digits) : 0;
+}
+
+// Oldest -> Newest (lowest order number pehle). Same time ho to order number se.
+function compareOrdersOldestFirst(a, b) {
+  const diff = new Date(a.createdAt) - new Date(b.createdAt);
+  if (diff !== 0) return diff;
+  return orderNumberOf(a) - orderNumberOf(b);
+}
+
 function groupByCustomer(orders) {
   const map = new Map();
   for (const order of orders) {
@@ -385,8 +398,10 @@ function groupByCustomer(orders) {
 
   return Array.from(map.values())
     .map((groupOrders) => {
-      groupOrders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-      const first = groupOrders[0];
+      // Customer ke andar bhi orders purane se naye (oldest pehle)
+      groupOrders.sort(compareOrdersOldestFirst);
+      // Customer ka naam/email/address pehle ki tarah LATEST order se hi liya jata hai
+      const first = groupOrders[groupOrders.length - 1];
       const customerName =
         `${first.customer?.firstName || ""} ${first.customer?.lastName || ""}`.trim() ||
         first.shippingAddress?.name ||
@@ -438,6 +453,7 @@ function groupByCustomer(orders) {
         hasSafetyFlag,
         latestOrderDate,
         oldestOrderDate,
+        oldestOrderNumber: orderNumberOf(groupOrders[0]),
         holdSummary: {
           heldOrdersCount,
           readyItemsCount,
@@ -1151,7 +1167,8 @@ export default function FulfillmentDashboard() {
   // Tab & Filters
   const [selectedTab, setSelectedTab] = useState(0);
   const [channelFilter, setChannelFilter] = useState([]);
-  const [sortOrder, setSortOrder] = useState("default");
+  const DEFAULT_SORT = "date_asc"; // Purane orders sab se upar (pehle pack & ship)
+  const [sortOrder, setSortOrder] = useState(DEFAULT_SORT);
   const [isFiltersFolded, setIsFiltersFolded] = useState(true);
   const [queryValue, setQueryValue] = useState("");
   const [expandedGroups, setExpandedGroups] = useState(new Set());
@@ -1227,7 +1244,9 @@ export default function FulfillmentDashboard() {
 
     return [...result].sort((a, b) => {
       if (sortOrder === "date_asc") {
-        return (a.oldestOrderDate || 0) - (b.oldestOrderDate || 0);
+        const diff = (a.oldestOrderDate || 0) - (b.oldestOrderDate || 0);
+        if (diff !== 0) return diff;
+        return (a.oldestOrderNumber || 0) - (b.oldestOrderNumber || 0);
       }
       if (sortOrder === "date_desc") {
         return (b.latestOrderDate || 0) - (a.latestOrderDate || 0);
@@ -1271,7 +1290,7 @@ export default function FulfillmentDashboard() {
     return pullListItems.filter((item) => channelFilter.includes(item.sourceName));
   }, [pullListItems, channelFilter]);
 
-  const activeFiltersCount = (channelFilter.length > 0 ? 1 : 0) + (sortOrder !== "default" ? 1 : 0);
+  const activeFiltersCount = (channelFilter.length > 0 ? 1 : 0) + (sortOrder !== DEFAULT_SORT ? 1 : 0);
 
   return (
     <AppProvider i18n={enTranslations}>
@@ -1332,7 +1351,7 @@ export default function FulfillmentDashboard() {
                           onClearAll={() => {
                             setQueryValue("");
                             setChannelFilter([]);
-                            setSortOrder("default");
+                            setSortOrder(DEFAULT_SORT);
                           }}
                           filters={[]}
                         />
@@ -1371,14 +1390,14 @@ export default function FulfillmentDashboard() {
                               allowMultiple
                             />
                           </div>
-                          {(channelFilter.length > 0 || sortOrder !== "default") && (
+                          {(channelFilter.length > 0 || sortOrder !== DEFAULT_SORT) && (
                             <div style={{ alignSelf: "flex-end" }}>
                               <Button
                                 variant="plain"
                                 tone="critical"
                                 onClick={() => {
                                   setChannelFilter([]);
-                                  setSortOrder("default");
+                                  setSortOrder(DEFAULT_SORT);
                                 }}
                               >
                                 Reset Filters
